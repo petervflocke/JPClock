@@ -103,10 +103,13 @@ typedef float pres_t;
 
 #define IntensityWait 250
 
-// Time zone definition and DST automatic on/off
-// #define DST_ON true
-#define CEST_DELTA 2
-#define CET_DELTA  1
+// DST transition test mode:
+// 0 = normal operation
+// 1 = start 30 seconds before the switch to summer time (CEST)
+// 2 = start 30 seconds before the switch to winter time (CET)
+#define DST_TEST_MODE 0
+#define DST_TEST_LEAD_SECONDS 30
+
 // Define time to resync
 // 12h = 12*60*60=43200
 #define NTPRESYNC 3600

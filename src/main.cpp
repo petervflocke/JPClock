@@ -74,21 +74,17 @@ QueueHandle_t xQueue;
 MD_REncoder R = MD_REncoder(PIN_A, PIN_B);
 
 WiFiUDP ntpUDP;
+// Keep the internal clock in UTC. Local time, including DST, is derived via
+// the Timezone rules below whenever the UI or logic needs local wall-clock time.
 NTPClient timeClient(ntpUDP, "europe.pool.ntp.org", 0);
 unsigned long NTPSyncPeriod = NTPRESYNC;
-boolean DSTFlag = false;       // indicate if DS is on/off based on the time for Germany / CET_DELTA,CEST_DELTA
 boolean SyncNTPError = false;  // true if the last NTP was finished with an error due the wifi or ntp failure
 
 ClockStates ClockState = _Clock_init;   // current clock status
 ClockStates goBackState = _Clock_init;  // last clock status
 
-// more time zones, see  http://en.wikipedia.org/wiki/Time_zones_of_Europe
-// United Kingdom (London, Belfast)
-// TimeChangeRule rBST = {"BST", Last, Sun, Mar, 1, 60};   //British Summer Time
-// TimeChangeRule rGMT = {"GMT", Last, Sun, Oct, 2, 0};    //Standard Time
-// Timezone UK(rBST, rGMT);
-TimeChangeRule rCEST = { "CEST", Last, Sun, Mar, 2, 120 };  // starts last Sunday in March at 2:00 am, UTC offset +120 minutes; Central European Summer Time (CEST_DELTA)
-TimeChangeRule rCET = { "CET", Last, Sun, Oct, 3, 60 };     // ends last Sunday in October at 3:00 am, UTC offset +60 minutes; Central European Time (CET_DELTA)
+TimeChangeRule rCEST = { "CEST", Last, Sun, Mar, 2, 120 };  // Central European Summer Time
+TimeChangeRule rCET = { "CET", Last, Sun, Oct, 3, 60 };     // Central European Time
 Timezone CET(rCEST, rCET);
 
 
@@ -131,16 +127,11 @@ Adafruit_MQTT_Subscribe ledMQTT = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME fe
 // for some reason (only affects ESP8266, likely an arduino-builder bug).
 boolean MQTT_connect();
 void clearScreen(void);
-time_t requestSync();
-void processSyncMessage();
-boolean SetUpDST(uint8_t _month, uint8_t _day, uint8_t _weekday);
-void correctByDST();
 boolean SyncNTP();
 boolean StartSyncNTP();
 void SetupWiFi(void);
 boolean updateTtime(int &value, int &lvalue, int newvalue, char what);
 uint8_t IntensityMap(uint16_t sensor);
-boolean checkTime(uint8_t hh, uint8_t mm, uint8_t ss, boolean exact);
 uint8_t keyboard(ClockStates key_DIR_CW, ClockStates key_DIR_CCW, ClockStates key_SW_DOWN, ClockStates key_SW_UP);
 boolean occupied(int ptrA, const int snakeLength, int *snakeX, int *snakeY);
 int next(int ptr, const int snakeLength);
@@ -156,11 +147,22 @@ void processEncoder();
 void taskMQTT(void *parameter);
 String digitalClockString();
 String printDigits(int digits);
+String formatTimeStamp(time_t stamp);
+String formatLocalTimeStamp(time_t utc);
+void printClockTimes(const char *prefix);
+void rememberTimezoneState();
+void announceTimezoneChange();
+void applyDstTestTime();
+time_t buildUtcTime(uint16_t yearValue, uint8_t monthValue, uint8_t dayValue, uint8_t hourValue, uint8_t minuteValue, uint8_t secondValue);
+uint8_t lastSundayOfMonth(uint16_t yearValue, uint8_t monthValue);
 
 
 //globals for screensaver status main loop and MQTT updates
 bool screenSaverNotActive = true;
 String lastTime = "";
+char currentTimezoneAbbrev[6] = "";
+bool timezoneStateKnown = false;
+bool pendingTimezoneRefresh = false;
 
 
 // Parameter section, just one for the time being
@@ -173,6 +175,72 @@ boolean DingOnOff = true;
 #define DACVoiceCoil 26
 #define voiceCoilMin 78 /* originally 58 to be increased for a high temperature in the room  */
 #define voiceCoilMax 99 /* 95 originally */
+#define voiceCoilLow 0
+#define voiceCoilMid 60
+#define voiceCoilHigh 98
+#define voiceCoilWiFiStart voiceCoilMax
+#define voiceCoilWiFiEnd voiceCoilLow
+
+enum VoiceCoilState : uint8_t {
+  _vcKickHigh,
+  _vcKickRelease,
+  _vcRandomMotion
+};
+
+VoiceCoilState voiceCoilState = _vcKickHigh;
+Schedular VoiceCoilMotion(_Millis);
+long voiceCoilPeriod = 80;
+
+uint8_t nextVoiceCoilLevel(uint8_t currentLevel) {
+  // Use a few distinct levels instead of small random changes near the top.
+  static const uint8_t levels[] = { voiceCoilLow, voiceCoilMid, voiceCoilHigh };
+  uint8_t nextLevel = currentLevel;
+
+  while (nextLevel == currentLevel) {
+    nextLevel = levels[random(0, 3)];
+  }
+
+  // Occasionally inject a full kick so the arm does not settle in place.
+  if (currentLevel != voiceCoilHigh && random(0, 6) == 0) {
+    nextLevel = voiceCoilHigh;
+  }
+
+  return nextLevel;
+}
+
+void startVoiceCoilMotion(bool withKick = true) {
+  voiceCoilState = withKick ? _vcKickHigh : _vcRandomMotion;
+  if (withKick) {
+    dacWrite(DACVoiceCoil, voiceCoilHigh);
+    voiceCoilPeriod = 90;
+    VoiceCoilMotion.start();
+  } else {
+    dacWrite(DACVoiceCoil, voiceCoilMid);
+    voiceCoilPeriod = 80;
+    VoiceCoilMotion.start();
+  }
+}
+
+void updateVoiceCoilMotion() {
+  static uint8_t currentLevel = voiceCoilLow;
+
+  if (voiceCoilState == _vcKickHigh && VoiceCoilMotion.check(voiceCoilPeriod)) {
+    currentLevel = voiceCoilHigh;
+    dacWrite(DACVoiceCoil, voiceCoilLow);
+    voiceCoilState = _vcKickRelease;
+    voiceCoilPeriod = 120;
+  } else if (voiceCoilState == _vcKickRelease && VoiceCoilMotion.check(voiceCoilPeriod)) {
+    currentLevel = voiceCoilLow;
+    voiceCoilState = _vcRandomMotion;
+    currentLevel = voiceCoilMid;
+    dacWrite(DACVoiceCoil, currentLevel);
+    voiceCoilPeriod = 80;
+  } else if (voiceCoilState == _vcRandomMotion && VoiceCoilMotion.check(voiceCoilPeriod)) {
+    currentLevel = nextVoiceCoilLevel(currentLevel);
+    dacWrite(DACVoiceCoil, currentLevel);
+    voiceCoilPeriod = random(45, 121);
+  }
+}
 
 
 void clearScreen(void) {
@@ -182,59 +250,12 @@ void clearScreen(void) {
   dacWrite(DACVoiceCoil, 0);
 }
 
-/* to be removed
-// Time management 
-time_t requestSync() {return 0;} // the time will be sent later in response to serial mesg
-
-void processSyncMessage() {
-  // unsigned long pctime = 1509235190;
-  unsigned long pctime = timeClient.getEpochTime();
-  setTime(pctime); // Sync clock to the time received on the serial port
-}
-
-
-boolean SetUpDST(uint8_t _month, uint8_t _day, uint8_t _weekday) {
-// Dst = True for summer time 
-// _weekday = day of the week Sunday = 1, Saturday = 7
-
-  if (_month < 3 || _month > 10)  return false; 
-  if (_month > 3 && _month < 10)  return true; 
-
-  int previousSunday = _day - _weekday;
-  if (_month == 3)  return previousSunday >= 24;
-  if (_month == 10) return previousSunday < 24;
-
-  return false; // this line never gonna happend
-}
-
-void correctByDST() {
-  //Check if DST has to correct the time
-  if (month() == 3) {
-    if (day() - weekday() >= 24) {
-      if ( (hour() == 2) && (!DSTFlag) ) {
-        DSTFlag = true;
-        adjustTime(+SECS_PER_HOUR);
-      }
-    }
-  } else if (month() == 10) {
-    if (day() - weekday() >= 24) {
-      if ( (hour() == 2) && (DSTFlag) ) {
-        DSTFlag = false;
-        adjustTime(-SECS_PER_HOUR);
-      }      
-    }
-  }        
-}
-*/
-
 boolean SyncNTP() {
 
   PRINTS("Contacting NTP Server process\n");
   if (timeClient.forceUpdate()) {
-    PRINTS("NTP sync OK, UTC=");
-    PRINTS(timeClient.getFormattedTime());
-    PRINTLN;
     setTime(timeClient.getEpochTime());
+    printClockTimes("NTP sync OK");
     return true;
   } else {
     PRINTS("NTP sync failed!");
@@ -270,6 +291,86 @@ boolean StartSyncNTP() {
   return SyncError;
 }
 
+time_t buildUtcTime(uint16_t yearValue, uint8_t monthValue, uint8_t dayValue, uint8_t hourValue, uint8_t minuteValue, uint8_t secondValue) {
+  tmElements_t tm;
+  tm.Second = secondValue;
+  tm.Minute = minuteValue;
+  tm.Hour = hourValue;
+  tm.Day = dayValue;
+  tm.Month = monthValue;
+  tm.Year = CalendarYrToTm(yearValue);
+  return makeTime(tm);
+}
+
+uint8_t lastSundayOfMonth(uint16_t yearValue, uint8_t monthValue) {
+  const uint8_t nextMonth = monthValue == 12 ? 1 : monthValue + 1;
+  const uint16_t nextMonthYear = monthValue == 12 ? yearValue + 1 : yearValue;
+  const time_t lastDay = buildUtcTime(nextMonthYear, nextMonth, 1, 0, 0, 0) - SECS_PER_DAY;
+  return day(lastDay) - (weekday(lastDay) - 1);
+}
+
+String formatTimeStamp(time_t stamp) {
+  return String(year(stamp)) + "-" + (month(stamp) < 10 ? "0" : "") + String(month(stamp)) + "-" + (day(stamp) < 10 ? "0" : "") + String(day(stamp))
+         + " " + (hour(stamp) < 10 ? "0" : "") + String(hour(stamp)) + ":" + (minute(stamp) < 10 ? "0" : "") + String(minute(stamp))
+         + ":" + (second(stamp) < 10 ? "0" : "") + String(second(stamp));
+}
+
+String formatLocalTimeStamp(time_t utc) {
+  TimeChangeRule *tcr;
+  const time_t local = CET.toLocal(utc, &tcr);
+  return formatTimeStamp(local) + " " + String(tcr ? tcr->abbrev : "TZ?");
+}
+
+void printClockTimes(const char *prefix) {
+  PRINTS(prefix);
+  PRINTS(" UTC=");
+  PRINTS(formatTimeStamp(now()));
+  PRINTS(" Local=");
+  PRINTS(formatLocalTimeStamp(now()));
+  PRINTLN;
+}
+
+void rememberTimezoneState() {
+  TimeChangeRule *tcr;
+  CET.toLocal(now(), &tcr);
+  if (!tcr) return;
+  strncpy(currentTimezoneAbbrev, tcr->abbrev, sizeof(currentTimezoneAbbrev) - 1);
+  currentTimezoneAbbrev[sizeof(currentTimezoneAbbrev) - 1] = '\0';
+  timezoneStateKnown = true;
+}
+
+void announceTimezoneChange() {
+  TimeChangeRule *tcr;
+  CET.toLocal(now(), &tcr);
+  if (!tcr) return;
+
+  if (!timezoneStateKnown) {
+    rememberTimezoneState();
+    return;
+  }
+
+  if (strncmp(currentTimezoneAbbrev, tcr->abbrev, sizeof(currentTimezoneAbbrev)) != 0) {
+    strncpy(currentTimezoneAbbrev, tcr->abbrev, sizeof(currentTimezoneAbbrev) - 1);
+    currentTimezoneAbbrev[sizeof(currentTimezoneAbbrev) - 1] = '\0';
+    printClockTimes("Timezone change");
+    pendingTimezoneRefresh = true;
+  }
+}
+
+void applyDstTestTime() {
+#if DST_TEST_MODE == 1 || DST_TEST_MODE == 2
+  const uint16_t testYear = year(now());
+  const uint8_t testMonth = DST_TEST_MODE == 1 ? 3 : 10;
+  const uint8_t testDay = lastSundayOfMonth(testYear, testMonth);
+  const time_t transitionUtc = buildUtcTime(testYear, testMonth, testDay, 1, 0, 0);
+  setTime(transitionUtc - DST_TEST_LEAD_SECONDS);
+  rememberTimezoneState();
+  printClockTimes("DST test time");
+  zoneInfo0.setText(DST_TEST_MODE == 1 ? "DST->CEST" : "DST->CET", _SCROLL_LEFT, _TO_FULL, InfoTick1, I0s, I0e);
+  zoneInfo0.Animate(true);
+#endif
+}
+
 void SetupWiFi(void) {
   Schedular UpdateWifi(_Seconds);  // Wifi reconnect
   int i;
@@ -279,7 +380,10 @@ void SetupWiFi(void) {
 
   WiFi.disconnect();
   WiFi.softAPdisconnect(true);
-  for (int x = voiceCoilMax; x > voiceCoilMin; dacWrite(DACVoiceCoil, x--)) { delay(10);}
+  for (int x = voiceCoilWiFiStart; x >= voiceCoilWiFiEnd; x--) {
+    dacWrite(DACVoiceCoil, x);
+    delay(10);
+  }
   WiFi.mode(WIFI_STA);
   PRINT("SSID", sWIFI_SSID.c_str());
   PRINTLN;
@@ -301,8 +405,8 @@ void SetupWiFi(void) {
     if (zoneInfo1.Animate(false)) matrix.write();
     if (zoneInfo1.AnimateDone()) zoneInfo1.Reset();
     if (UpdateWifi.check(1)) {
-      // WiFi.begin(WIFI_SSID, WIFI_PASWD);
-      dacWrite(DACVoiceCoil, map(i, 0, MAXRET, voiceCoilMax-5, voiceCoilMin+5));      
+      // Use a clear downward sweep so the arm visibly shows retry progress.
+      dacWrite(DACVoiceCoil, map(i, 0, MAXRET, voiceCoilWiFiStart, voiceCoilWiFiEnd));
       PRINTS(".");
       i++;
     }
@@ -372,14 +476,6 @@ uint8_t IntensityMap(uint16_t sensor) {
   else Intensity = 15;
   return Intensity;
 }
-
-/*
-boolean checkTime(uint8_t hh, uint8_t mm, uint8_t ss, boolean exact) {
-  time_t LocalTime = CET.toLocal(now());
-  if (exact) return (hh == hour(LocalTime) && mm == minute(LocalTime) && ss == second(LocalTime));
-  else return (hh == hour(LocalTime) && mm == minute(LocalTime) && ss <= second(LocalTime));
-}
-*/
 
 uint8_t keyboard(ClockStates key_DIR_CW, ClockStates key_DIR_CCW, ClockStates key_SW_DOWN, ClockStates key_SW_UP) {
   uint8_t key = DIR_NONE;
@@ -661,25 +757,9 @@ void setup() {
     SetupWiFi();
     SyncNTPError = StartSyncNTP();
     if (!SyncNTPError) {
-      /*
-        if (SetUpDST(month(), day(), weekday())) {
-          DSTFlag = true;
-          timeClient.setTimeOffset(SECS_PER_HOUR*CEST_DELTA);
-          adjustTime(+SECS_PER_HOUR*CEST_DELTA);
-        } else {
-          DSTFlag = false;
-          timeClient.setTimeOffset(SECS_PER_HOUR*CET_DELTA);
-          adjustTime(+SECS_PER_HOUR*CET_DELTA);
-          //adjustTime(+48*60);
-        }    
-        // setTime(1512093784+60*56+40); // Friday, December 1, 2017 2:03:04 AM
-        */
-      PRINTS("             UTC Time=");
-      PRINTS(timeClient.getFormattedTime());
-      PRINTLN;
-      PRINTS(digitalClockString());
-      // correctByDST();
-      // NTPUpdateTask.start( ((12-(hour()%12))*60 - minute())*60-second()+10*60 -NTPRESYNC );
+      rememberTimezoneState();
+      applyDstTestTime();
+      printClockTimes("Startup sync");
       zoneInfo0.setText("Sync OK", _SCROLL_LEFT, _TO_LEFT, InfoTick1, I0s, I0e);
       zoneInfo0.Animate(true);
       delay(250);
@@ -936,15 +1016,22 @@ void loop() {
     // check if the last NTP sync was successful, if not reduce the resync time to 60s
     if (SyncNTPError) NTPSyncPeriod = 60;
     else NTPSyncPeriod = NTPRESYNC;
+
+    announceTimezoneChange();
+    if (pendingTimezoneRefresh) {
+      if (ClockState == _Clock_simple_time) {
+        ClockState = _Clock_simple_time_init;
+        pendingTimezoneRefresh = false;
+      } else if (ClockState == _Clock_complete_info) {
+        ClockState = _Clock_complete_info_init;
+        pendingTimezoneRefresh = false;
+      }
+    }
+
     // check if NTP sync is due?
     // If yes change clock status
     if (NTPUpdateTask.check(NTPSyncPeriod)) {
       ClockState = _Clock_NTP_Sync;
-    }
-
-    // for all status except ... check if the time of DST has came and if yes change the time accordingly
-    if (ClockState != _Clock_init) {
-      // correctByDST();
     }
 
     // check time dependant actions
@@ -978,24 +1065,22 @@ void loop() {
         //          break;
 
       case _Clock_NTP_Sync:
-        PRINTS(digitalClockString());
+        printClockTimes("NTP resync start");
         if (StartSyncNTP()) {  // error by NTP sync
           zoneInfo0.setText("NTP Sync ERROR", _SCROLL_LEFT, _TO_FULL, InfoTick1, I0s, I0e);
           zoneInfo0.Animate(true);
           SyncNTPError = true;
         } else {
+          rememberTimezoneState();
           zoneInfo0.setText("NTP Sync OK", _SCROLL_LEFT, _TO_FULL, InfoTick1, I0s, I0e);
           zoneInfo0.Animate(true);
-          PRINTS("NTP sync OK, UTC=");
-          PRINTS(timeClient.getFormattedTime());
-          PRINTLN;
-          // correctByDST();
+          printClockTimes("NTP resync OK");
           SyncNTPError = false;
         }
         ClockState = goBackState;
         PRINT("NTP Resync Completed\nNew mode=", ClockState);
         PRINTLN;
-        PRINTS(digitalClockString());
+        printClockTimes("NTP resync done");
         break;
 
       case _Clock_Temp_init:
@@ -1104,6 +1189,7 @@ void loop() {
 
         //IntensityCheck.start();
         SnakeUpdate.start();
+        startVoiceCoilMotion();
         randomSeed(analogRead(pinRandom));  // Initialize random generator
         SnakeState = _sInit;
 
@@ -1127,6 +1213,7 @@ void loop() {
         updateDisplay |= zoneClockH1.Animate(false);
         updateDisplay |= zoneClockM0.Animate(false);
         updateDisplay |= zoneClockM1.Animate(false);
+        updateVoiceCoilMotion();
         updateDisplay |= zoneClockS1.Animate(false);
         updateDisplay |= zoneClockS0.Animate(false);
 
@@ -1147,8 +1234,7 @@ void loop() {
               snakeRound = 0;
 
               SnakeState = _sRunA;
-
-              dacWrite(DACVoiceCoil, voiceCoilMax);
+              startVoiceCoilMotion();
 
               break;
 
@@ -1158,8 +1244,6 @@ void loop() {
               nextPtr = next(ptr, snakeLength);
               matrix.drawPixel(snakeX[ptr], snakeY[ptr], HIGH);  // Draw the head of the snake
               SnakeState = _sRunB;
-
-              dacWrite(DACVoiceCoil, random(voiceCoilMin, voiceCoilMax));
 
               break;
 
@@ -1203,7 +1287,6 @@ void loop() {
                   SnakeState = _sFail;
                 } else SnakeState = _sRunA;
               }
-              dacWrite(DACVoiceCoil, random(voiceCoilMin, voiceCoilMax));
               break;
             case _sFail:
               //                        PRINTS("\n Fail");
@@ -1218,7 +1301,7 @@ void loop() {
 
       case _Clock_menu_init:
         clearScreen();
-        zoneInfo0.setText("Menu:", _SCROLL_RIGHT, _TO_LEFT, InfoTick, I0s, I0e);
+        zoneInfo0.setText("Ding:", _SCROLL_RIGHT, _TO_LEFT, InfoTick, I0s, I0e);
         zoneInfo0.Animate(true);
         updateDisplay = false;
         goBackState = _Clock_menu_init;
