@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "260328-214751-az-delivery-devkit-v4",
+			"path": "../../../Documents/PlatformIO/Projects/260328-214751-az-delivery-devkit-v4"
+		}
+	],
+	"settings": {
+		"github.copilot.enable": {
+			"*": false
+		}
+	}
+}
