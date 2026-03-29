@@ -1391,7 +1391,7 @@ void loop() {
             case 2:
               // sprintf (DataStr, "%c%d%c", 160, (int)(mySensor.readTemperature()+0.5), 161);
               tempValue = round(mySensor.readTemperature());
-              sprintf(DataStr, "%d%c", (int)(tempValue), 161);
+              sprintf(DataStr, "%d%c", (int)(tempValue), GLYPH_DEGREE);
               textEffect = tempValue > round(averageTemp) ? _SCROLL_UP : tempValue < round(averageTemp) ? _SCROLL_DOWN
                                                                                                         : _SCROLL_LEFT;
               break;
@@ -1399,7 +1399,7 @@ void loop() {
               //sprintf (DataStr, "%c%.0f%c", 162, mySensor.readPressure() / 100.0F, 163);
 
               presValue = round(mySensor.readPressure() / 100.0F);
-              sprintf(DataStr, "%.0f%c", presValue, 163);
+              sprintf(DataStr, "%.0f%c", presValue, GLYPH_HPA);
               textEffect = presValue > round(averagePres) ? _SCROLL_UP : presValue < round(averagePres) ? _SCROLL_DOWN
                                                                                                         : _SCROLL_LEFT;
               //textEffect = _SCROLL_LEFT;

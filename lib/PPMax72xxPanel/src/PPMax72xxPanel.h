@@ -31,6 +31,7 @@
 class PPMax72xxPanel : public Adafruit_GFX {
 
 public:
+  using Print::write;
 
   /*
    * Create a new controler
@@ -72,6 +73,11 @@ public:
    * bitmap buffer is modified.
    */
   void drawPixel(int16_t x, int16_t y, uint16_t color);
+  void drawChar(int16_t x, int16_t y, unsigned char c, uint16_t color,
+                uint16_t bg, uint8_t size);
+  void drawChar(int16_t x, int16_t y, unsigned char c, uint16_t color,
+                uint16_t bg, uint8_t size_x, uint8_t size_y);
+  size_t write(uint8_t c) override;
 
   /*
    * As we can do this much faster then setting all the pixels one by
