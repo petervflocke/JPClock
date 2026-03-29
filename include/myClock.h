@@ -1,3 +1,5 @@
+#pragma once
+
 // Turn on debug statements to the serial output
 
 #define  DEBUG_ON 0
@@ -93,14 +95,26 @@ typedef float pres_t;
 #define pinRandom 32
 #define SnakeWait 50
 
+/* Digit animation speed for clock transitions. */
 #define ClockAnimTick 95
+/* General text animation speed. */
 #define InfoTick  15
+/* Slightly slower text animation speed used during startup/info prompts. */
 #define InfoTick1 25
+/* Slow scroll/blink speed for readable info pages. */
 #define InfoSlow  100
+/* Fast scroll speed for compact status/info text. */
 #define InfoQuick 18
+/* Delay before the next info page in complete-info mode. */
 #define FullInfoDelay 2000
+/* Refresh period for diagram/statistic mode. */
 #define DiagramDelay 200
+/* Pause before a remote message starts scrolling again. */
+#define RemoteMessageRepeatDelay 2500
+/* How long the HDD arm may move for one remote message. */
+#define RemoteMessageMotionMs 10000
 
+/* Interval for checking ambient light and adjusting display brightness. */
 #define IntensityWait 250
 
 // DST transition test mode:
@@ -137,6 +151,7 @@ typedef float pres_t;
 #define feedData "/feeds/data"
 #define feedOnOf "/feeds/onoff"
 #define feedLED  "/feeds/led"
+#define feedMsg  "/feeds/msg"
 
 #define AIO_SERVER      "io.adafruit.com"
 #define AIO_SERVERPORT  8883                   // use 8883 for SSL -1883
@@ -160,7 +175,9 @@ enum ClockStates
    _Clock_menu_init,
    _Clock_menu,
    _Clock_Temp_init,
-   _Clock_Temp,   
+   _Clock_Temp,
+   _Clock_remote_message_init,
+   _Clock_remote_message,
    _Clock_idle,
    _Clock_none
 };

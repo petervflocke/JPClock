@@ -5,6 +5,7 @@
 
 #include <Arduino.h>
 #include "myClock.h"
+#include "display_state.h"
 #include <TimeLib.h>
 #include <Timezone.h>
 #include <SPI.h>
@@ -100,6 +101,8 @@ Schedular ChimeQuarter(_Seconds);    // time for qurterly chime
 Schedular ChimeHour(_Seconds);       // time for hourly chime
 Schedular ChimeWait(_Millis);        // time to wait after 4 quarter chime
 Schedular UpdateMQTT(_Seconds);      // Frequency of updating IOT
+Schedular RemoteMessageRepeat(_Millis);
+Schedular RemoteMessageMotion(_Millis);
 
 // MP3 Player
 HardwareSerial DFPSerial(1);
@@ -119,9 +122,11 @@ Adafruit_MQTT_Publish presMQTT = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME feedP
 Adafruit_MQTT_Publish brigMQTT = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME feedBrig);
 Adafruit_MQTT_Publish onofMQTT = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME feedOnOf);
 Adafruit_MQTT_Publish dataMQTT = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME feedData);
+Adafruit_MQTT_Publish msgMQTTPub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME feedMsg);
 
 // Setup a feed for subscribing to changes.
 Adafruit_MQTT_Subscribe ledMQTT = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME feedLED);
+Adafruit_MQTT_Subscribe msgMQTTSub = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME feedMsg);
 
 // Bug workaround for Arduino 1.6.6, it seems to need a function declaration
 // for some reason (only affects ESP8266, likely an arduino-builder bug).
@@ -130,7 +135,6 @@ void clearScreen(void);
 boolean SyncNTP();
 boolean StartSyncNTP();
 void SetupWiFi(void);
-boolean updateTtime(int &value, int &lvalue, int newvalue, char what);
 uint8_t IntensityMap(uint16_t sensor);
 uint8_t keyboard(ClockStates key_DIR_CW, ClockStates key_DIR_CCW, ClockStates key_SW_DOWN, ClockStates key_SW_UP);
 boolean occupied(int ptrA, const int snakeLength, int *snakeX, int *snakeY);
@@ -155,6 +159,18 @@ void announceTimezoneChange();
 void applyDstTestTime();
 time_t buildUtcTime(uint16_t yearValue, uint8_t monthValue, uint8_t dayValue, uint8_t hourValue, uint8_t minuteValue, uint8_t secondValue);
 uint8_t lastSundayOfMonth(uint16_t yearValue, uint8_t monthValue);
+ClockStates normalizeClockStateForReturn(ClockStates state);
+void queueRemoteMessage(const char *message);
+bool hasPendingRemoteMessage();
+bool takePendingRemoteMessage();
+void queueRemoteMessageAck(const char *message);
+bool publishQueuedRemoteMessageAck();
+void queueRemoteMessageClear(const char *message);
+bool publishQueuedRemoteMessageClear();
+bool fetchLastRemoteMessage(String &message);
+String extractJsonStringField(const String &json, const char *fieldName);
+bool isRemoteMessageEmpty(const char *message);
+bool isRemoteMessageEmpty(const String &message);
 
 
 //globals for screensaver status main loop and MQTT updates
@@ -163,6 +179,20 @@ String lastTime = "";
 char currentTimezoneAbbrev[6] = "";
 bool timezoneStateKnown = false;
 bool pendingTimezoneRefresh = false;
+DisplayState displayState;
+SemaphoreHandle_t messageMutex;
+char pendingRemoteMessage[161] = "";
+char activeRemoteMessage[161] = "";
+char pendingRemoteAck[96] = "";
+char pendingRemoteClearMessage[161] = "";
+bool remoteMessagePending = false;
+bool remoteMessageActive = false;
+bool remoteMessageAckPending = false;
+bool remoteMessageClearPending = false;
+bool remoteMessageWaitingForRepeat = false;
+bool remoteMessageMotionActive = false;
+bool clockReadyForRemoteMessages = false;
+ClockStates remoteMessageReturnState = _Clock_complete_info_init;
 
 
 // Parameter section, just one for the time being
@@ -171,28 +201,47 @@ boolean DingOnOff = true;
 
 
 // PWM data for HDD voice coil
-// setting PWM properties
+// Keep the motion range away from the mechanical end stops. The arm is only
+// driven strongly during the startup kick; regular motion stays within the
+// quieter range and 0 fully releases the coil.
 #define DACVoiceCoil 26
-#define voiceCoilMin 78 /* originally 58 to be increased for a high temperature in the room  */
-#define voiceCoilMax 99 /* 95 originally */
-#define voiceCoilLow 0
-#define voiceCoilMid 60
-#define voiceCoilHigh 98
-#define voiceCoilWiFiStart voiceCoilMax
-#define voiceCoilWiFiEnd voiceCoilLow
+#define voiceCoilOff 0
+#define voiceCoilKick 130
+#define voiceCoilLow 20
+#define voiceCoilMid 75
+#define voiceCoilHigh 95
+#define voiceCoilWiFiStart voiceCoilHigh
+#define voiceCoilWiFiEnd voiceCoilOff
+#define voiceCoilKickMs 90
+#define voiceCoilReleaseMs 120
+#define voiceCoilSettleMs 80
+#define voiceCoilMotionMinMs 45
+#define voiceCoilMotionMaxMs 120
+#define voiceCoilHighPulseChance 6
 
 enum VoiceCoilState : uint8_t {
+  _vcOff,
   _vcKickHigh,
   _vcKickRelease,
   _vcRandomMotion
 };
 
-VoiceCoilState voiceCoilState = _vcKickHigh;
+VoiceCoilState voiceCoilState = _vcOff;
 Schedular VoiceCoilMotion(_Millis);
-long voiceCoilPeriod = 80;
+long voiceCoilPeriod = voiceCoilSettleMs;
+
+void setVoiceCoilLevel(uint8_t level) {
+  dacWrite(DACVoiceCoil, level);
+}
+
+void stopVoiceCoilMotion() {
+  voiceCoilState = _vcOff;
+  voiceCoilPeriod = voiceCoilSettleMs;
+  setVoiceCoilLevel(voiceCoilOff);
+}
 
 uint8_t nextVoiceCoilLevel(uint8_t currentLevel) {
-  // Use a few distinct levels instead of small random changes near the top.
+  // Use a few distinct levels inside the safe motion window.
   static const uint8_t levels[] = { voiceCoilLow, voiceCoilMid, voiceCoilHigh };
   uint8_t nextLevel = currentLevel;
 
@@ -200,23 +249,283 @@ uint8_t nextVoiceCoilLevel(uint8_t currentLevel) {
     nextLevel = levels[random(0, 3)];
   }
 
-  // Occasionally inject a full kick so the arm does not settle in place.
-  if (currentLevel != voiceCoilHigh && random(0, 6) == 0) {
+  // Occasionally jump to the top of the safe motion range.
+  if (currentLevel != voiceCoilHigh && random(0, voiceCoilHighPulseChance) == 0) {
     nextLevel = voiceCoilHigh;
   }
 
   return nextLevel;
 }
 
+ClockStates normalizeClockStateForReturn(ClockStates state) {
+  switch (state) {
+    case _Clock_simple_time_init:
+    case _Clock_simple_time:
+      return _Clock_simple_time_init;
+    case _Clock_complete_info_init:
+    case _Clock_complete_info:
+      return _Clock_complete_info_init;
+    case _Clock_Temp_init:
+    case _Clock_Temp:
+      return _Clock_Temp_init;
+    case _Clock_menu_init:
+    case _Clock_menu:
+      return _Clock_menu_init;
+    case _Clock_remote_message_init:
+    case _Clock_remote_message:
+      return remoteMessageReturnState;
+    default:
+      return _Clock_complete_info_init;
+  }
+}
+
+void queueRemoteMessage(const char *message) {
+  if (!message || isRemoteMessageEmpty(message) || !messageMutex) return;
+
+  xSemaphoreTake(messageMutex, portMAX_DELAY);
+  strncpy(pendingRemoteMessage, message, sizeof(pendingRemoteMessage) - 1);
+  pendingRemoteMessage[sizeof(pendingRemoteMessage) - 1] = '\0';
+  remoteMessagePending = true;
+  xSemaphoreGive(messageMutex);
+  PRINT("Queued remote message: ", pendingRemoteMessage);
+  PRINTLN;
+}
+
+bool hasPendingRemoteMessage() {
+  if (!messageMutex) return false;
+
+  xSemaphoreTake(messageMutex, portMAX_DELAY);
+  const bool pending = remoteMessagePending;
+  xSemaphoreGive(messageMutex);
+
+  return pending;
+}
+
+bool takePendingRemoteMessage() {
+  bool activated = false;
+
+  if (!messageMutex) return false;
+
+  xSemaphoreTake(messageMutex, portMAX_DELAY);
+  if (remoteMessagePending) {
+    strncpy(activeRemoteMessage, pendingRemoteMessage, sizeof(activeRemoteMessage) - 1);
+    activeRemoteMessage[sizeof(activeRemoteMessage) - 1] = '\0';
+    pendingRemoteMessage[0] = '\0';
+    remoteMessagePending = false;
+    remoteMessageActive = !isRemoteMessageEmpty(activeRemoteMessage);
+    activated = remoteMessageActive;
+  }
+  xSemaphoreGive(messageMutex);
+
+  if (activated) queueRemoteMessageClear(activeRemoteMessage);
+
+  return activated;
+}
+
+void queueRemoteMessageAck(const char *message) {
+  if (!messageMutex) return;
+
+  String ackMessage = "OK " + formatLocalTimeStamp(now());
+  if (message && message[0]) {
+    ackMessage += " | ";
+    ackMessage += message;
+  }
+
+  xSemaphoreTake(messageMutex, portMAX_DELAY);
+  strncpy(pendingRemoteAck, ackMessage.c_str(), sizeof(pendingRemoteAck) - 1);
+  pendingRemoteAck[sizeof(pendingRemoteAck) - 1] = '\0';
+  remoteMessageAckPending = true;
+  xSemaphoreGive(messageMutex);
+}
+
+bool publishQueuedRemoteMessageAck() {
+  char ackMessage[sizeof(pendingRemoteAck)];
+  bool shouldPublish = false;
+
+  if (!messageMutex) return true;
+
+  xSemaphoreTake(messageMutex, portMAX_DELAY);
+  if (remoteMessageAckPending) {
+    strncpy(ackMessage, pendingRemoteAck, sizeof(ackMessage) - 1);
+    ackMessage[sizeof(ackMessage) - 1] = '\0';
+    shouldPublish = true;
+  }
+  xSemaphoreGive(messageMutex);
+
+  if (!shouldPublish) return true;
+
+  if (dataMQTT.publish(ackMessage)) {
+    xSemaphoreTake(messageMutex, portMAX_DELAY);
+    remoteMessageAckPending = false;
+    pendingRemoteAck[0] = '\0';
+    xSemaphoreGive(messageMutex);
+    return true;
+  }
+
+  return false;
+}
+
+void queueRemoteMessageClear(const char *message) {
+  if (!messageMutex) return;
+
+  xSemaphoreTake(messageMutex, portMAX_DELAY);
+  strncpy(pendingRemoteClearMessage, message ? message : "", sizeof(pendingRemoteClearMessage) - 1);
+  pendingRemoteClearMessage[sizeof(pendingRemoteClearMessage) - 1] = '\0';
+  remoteMessageClearPending = true;
+  xSemaphoreGive(messageMutex);
+}
+
+bool publishQueuedRemoteMessageClear() {
+  char clearMessage[sizeof(pendingRemoteClearMessage)];
+  bool shouldPublish = false;
+
+  if (!messageMutex) return true;
+
+  xSemaphoreTake(messageMutex, portMAX_DELAY);
+  shouldPublish = remoteMessageClearPending;
+  strncpy(clearMessage, pendingRemoteClearMessage, sizeof(clearMessage) - 1);
+  clearMessage[sizeof(clearMessage) - 1] = '\0';
+  xSemaphoreGive(messageMutex);
+
+  if (!shouldPublish) return true;
+
+  String currentMessage;
+  if (!fetchLastRemoteMessage(currentMessage)) return false;
+
+  if (isRemoteMessageEmpty(currentMessage)) {
+    xSemaphoreTake(messageMutex, portMAX_DELAY);
+    remoteMessageClearPending = false;
+    pendingRemoteClearMessage[0] = '\0';
+    xSemaphoreGive(messageMutex);
+    return true;
+  }
+
+  if (currentMessage != String(clearMessage)) {
+    xSemaphoreTake(messageMutex, portMAX_DELAY);
+    remoteMessageClearPending = false;
+    pendingRemoteClearMessage[0] = '\0';
+    xSemaphoreGive(messageMutex);
+    return true;
+  }
+
+  if (msgMQTTPub.publish("#")) {
+    xSemaphoreTake(messageMutex, portMAX_DELAY);
+    remoteMessageClearPending = false;
+    pendingRemoteClearMessage[0] = '\0';
+    xSemaphoreGive(messageMutex);
+    return true;
+  }
+
+  return false;
+}
+
+bool isRemoteMessageEmpty(const char *message) {
+  if (!message) return true;
+  while (*message == ' ' || *message == '\r' || *message == '\n' || *message == '\t') message++;
+  return *message == '\0' || (*message == '#' && *(message + 1) == '\0');
+}
+
+bool isRemoteMessageEmpty(const String &message) {
+  return isRemoteMessageEmpty(message.c_str());
+}
+
+String extractJsonStringField(const String &json, const char *fieldName) {
+  const String key = "\"" + String(fieldName) + "\":";
+  const int keyStart = json.indexOf(key);
+  if (keyStart < 0) return "";
+
+  const int valueStart = json.indexOf('"', keyStart + key.length());
+  if (valueStart < 0) return "";
+
+  String value;
+  bool escaped = false;
+  for (int i = valueStart + 1; i < json.length(); i++) {
+    const char c = json.charAt(i);
+    if (escaped) {
+      switch (c) {
+        case 'n':
+          value += '\n';
+          break;
+        case 'r':
+          break;
+        case 't':
+          value += '\t';
+          break;
+        default:
+          value += c;
+          break;
+      }
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else if (c == '"') {
+      break;
+    } else {
+      value += c;
+    }
+  }
+
+  return value;
+}
+
+bool fetchLastRemoteMessage(String &message) {
+  if (!WiFi.isConnected()) {
+    PRINTS("Msg fetch skipped: WiFi disconnected\n");
+    return false;
+  }
+
+  WiFiClientSecure httpClient;
+  httpClient.setInsecure();
+  if (!httpClient.connect(AIO_SERVER, 443)) {
+    PRINTS("Msg fetch connect failed\n");
+    return false;
+  }
+
+  const String path = "/api/v2/" + String(AIO_USERNAME) + String(feedMsg) + "/data?limit=1&include=value";
+  httpClient.print(String("GET ") + path + " HTTP/1.1\r\n"
+                   + "Host: " + AIO_SERVER + "\r\n"
+                   + "User-Agent: JPClock\r\n"
+                   + "X-AIO-Key: " + AIO_KEY + "\r\n"
+                   + "Connection: close\r\n\r\n");
+  PRINT("Msg fetch path: ", path);
+  PRINTLN;
+
+  const String statusLine = httpClient.readStringUntil('\n');
+  PRINT("Msg fetch HTTP: ", statusLine);
+  PRINTLN;
+  if (statusLine.indexOf(" 200 ") < 0) {
+    PRINT("Msg fetch status: ", statusLine);
+    PRINTLN;
+    httpClient.stop();
+    return false;
+  }
+
+  while (httpClient.connected()) {
+    const String headerLine = httpClient.readStringUntil('\n');
+    if (headerLine == "\r") break;
+  }
+
+  const String body = httpClient.readString();
+  httpClient.stop();
+  PRINT("Msg fetch body: ", body);
+  PRINTLN;
+
+  message = extractJsonStringField(body, "value");
+  PRINT("Msg fetch parsed: ", message);
+  PRINTLN;
+  if (isRemoteMessageEmpty(message)) message = "";
+  return true;
+}
+
 void startVoiceCoilMotion(bool withKick = true) {
   voiceCoilState = withKick ? _vcKickHigh : _vcRandomMotion;
   if (withKick) {
-    dacWrite(DACVoiceCoil, voiceCoilHigh);
-    voiceCoilPeriod = 90;
+    setVoiceCoilLevel(voiceCoilKick);
+    voiceCoilPeriod = voiceCoilKickMs;
     VoiceCoilMotion.start();
   } else {
-    dacWrite(DACVoiceCoil, voiceCoilMid);
-    voiceCoilPeriod = 80;
+    setVoiceCoilLevel(voiceCoilMid);
+    voiceCoilPeriod = voiceCoilSettleMs;
     VoiceCoilMotion.start();
   }
 }
@@ -224,21 +533,23 @@ void startVoiceCoilMotion(bool withKick = true) {
 void updateVoiceCoilMotion() {
   static uint8_t currentLevel = voiceCoilLow;
 
-  if (voiceCoilState == _vcKickHigh && VoiceCoilMotion.check(voiceCoilPeriod)) {
-    currentLevel = voiceCoilHigh;
-    dacWrite(DACVoiceCoil, voiceCoilLow);
+  if (voiceCoilState == _vcOff) {
+    currentLevel = voiceCoilOff;
+  } else if (voiceCoilState == _vcKickHigh && VoiceCoilMotion.check(voiceCoilPeriod)) {
+    currentLevel = voiceCoilKick;
+    setVoiceCoilLevel(voiceCoilOff);
     voiceCoilState = _vcKickRelease;
-    voiceCoilPeriod = 120;
+    voiceCoilPeriod = voiceCoilReleaseMs;
   } else if (voiceCoilState == _vcKickRelease && VoiceCoilMotion.check(voiceCoilPeriod)) {
-    currentLevel = voiceCoilLow;
+    currentLevel = voiceCoilOff;
     voiceCoilState = _vcRandomMotion;
     currentLevel = voiceCoilMid;
-    dacWrite(DACVoiceCoil, currentLevel);
-    voiceCoilPeriod = 80;
+    setVoiceCoilLevel(currentLevel);
+    voiceCoilPeriod = voiceCoilSettleMs;
   } else if (voiceCoilState == _vcRandomMotion && VoiceCoilMotion.check(voiceCoilPeriod)) {
     currentLevel = nextVoiceCoilLevel(currentLevel);
-    dacWrite(DACVoiceCoil, currentLevel);
-    voiceCoilPeriod = random(45, 121);
+    setVoiceCoilLevel(currentLevel);
+    voiceCoilPeriod = random(voiceCoilMotionMinMs, voiceCoilMotionMaxMs + 1);
   }
 }
 
@@ -247,7 +558,7 @@ void clearScreen(void) {
   matrix.setClip(0, matrix.width(), 0, matrix.height());
   matrix.fillScreen(LOW);
   matrix.write();
-  dacWrite(DACVoiceCoil, 0);
+  stopVoiceCoilMotion();
 }
 
 boolean SyncNTP() {
@@ -399,7 +710,7 @@ void SetupWiFi(void) {
   while ((WiFi.status() != WL_CONNECTED) && i != 0) {
     if (i >= MAXRET) {
       PRINTS("\nWIFI connection failled - rebooting\n");
-      dacWrite(DACVoiceCoil,0);
+      stopVoiceCoilMotion();
       ESP.restart();  // reboot and try again
     }
     if (zoneInfo1.Animate(false)) matrix.write();
@@ -419,41 +730,6 @@ void SetupWiFi(void) {
   PRINTS("IP address: \n");
   PRINTS(WiFi.localIP());
   PRINTLN;
-}
-
-boolean updateTtime(int &value, int &lvalue, int newvalue, char what) {
-  String sValue;
-  if (value != newvalue) {
-    value = newvalue;
-    if (lvalue / 10 != value / 10) {
-      sValue = String(lvalue / 10) + "\n" + String(value / 10);
-      switch (what) {
-        case 'H':
-          zoneClockH1.setText(sValue, _SCROLL_UP_SMOOTH, _NONE_MOD, ClockAnimTick, H1s, H1e);
-          break;
-        case 'M':
-          zoneClockM1.setText(sValue, _SCROLL_UP_SMOOTH, _NONE_MOD, ClockAnimTick, M1s, M1e);
-          break;
-        case 'S':
-          zoneClockS1.setText(sValue, _SCROLL_UP_SMOOTH, _NONE_MOD, ClockAnimTick, S1s, S1e);
-          break;
-      }
-    }
-    sValue = String(lvalue % 10) + "\n" + String(value % 10);
-    switch (what) {
-      case 'H':
-        zoneClockH0.setText(sValue, _SCROLL_UP_SMOOTH, _NONE_MOD, ClockAnimTick, H0s, H0e);
-        break;
-      case 'M':
-        zoneClockM0.setText(sValue, _SCROLL_UP_SMOOTH, _NONE_MOD, ClockAnimTick, M0s, M0e);
-        break;
-      case 'S':
-        zoneClockS0.setText(sValue, _SCROLL_UP_SMOOTH, _NONE_MOD, ClockAnimTick, S0s, S0e);
-        break;
-    }
-    lvalue = value;
-    return true;
-  } else return false;
 }
 
 uint8_t IntensityMap(uint16_t sensor) {
@@ -748,13 +1024,26 @@ void setup() {
     // zero temperature table
     for (int i = 0; i < NumberOfPoints; tempTable[i++] = 0)
       ;
-    for (int i = 0; i < NumberOfPoints; humiTable[i++] = 0)
-      ;
-    for (int i = 0; i < NumberOfPoints; presTable[i++] = 0)
-      ;
+	    for (int i = 0; i < NumberOfPoints; humiTable[i++] = 0)
+	      ;
+	    for (int i = 0; i < NumberOfPoints; presTable[i++] = 0)
+	      ;
 
-    client.setInsecure();
-    SetupWiFi();
+	    bufMutex = xSemaphoreCreateMutex();
+	    messageMutex = xSemaphoreCreateMutex();
+
+	    client.setInsecure();
+	    SetupWiFi();
+    {
+      String startupMessage;
+      if (fetchLastRemoteMessage(startupMessage) && !isRemoteMessageEmpty(startupMessage)) {
+        PRINT("Startup Msg: ", startupMessage);
+        PRINTLN;
+        queueRemoteMessage(startupMessage.c_str());
+      } else {
+        PRINTS("Startup Msg: none\n");
+      }
+    }
     SyncNTPError = StartSyncNTP();
     if (!SyncNTPError) {
       rememberTimezoneState();
@@ -781,13 +1070,11 @@ void setup() {
     matrix.write();
 
     goBackState = _Clock_complete_info;
-    ClockState = _Clock_complete_info_init;
+	    ClockState = _Clock_complete_info_init;
 
-    //ClockState = _Clock_simple_time_init;
-
-    bufMutex = xSemaphoreCreateMutex();
-    _t = mySensor.readTemperature();
-    _h = mySensor.readHumidity();
+	    //ClockState = _Clock_simple_time_init;
+	    _t = mySensor.readTemperature();
+	    _h = mySensor.readHumidity();
     _p = mySensor.readPressure() / 100.0F;
     _l = lightMeter.readLightLevel();
 
@@ -857,46 +1144,17 @@ void loop() {
     if (zoneInfo1.AnimateDone()) zoneInfo1.Reset();
     delay(10);
   } else {
-    // current and last time values
-    static int valueH = 0;
-    static int valueM = 0;
-    static int valueS = 0;
-    static int lvalueH = -1;
-    static int lvalueM = -1;
-    static int lvalueS = -1;
-
-    static bool flasher = false;           // seconds passing flasher
-    static uint8_t intensity = 0;          // brithness of the led matrix - all modules
-    static uint8_t lintensity = 0;         // last brithness of the led matrix - all modules
-    static boolean updateDisplay = false;  // Any change => display needs to be updated
-
-    static char DataStr[] = "xx:xx:xx Xxx xx Xxx xxxx                ";
-    // 0123456789012345678901234567891234567890
-    // 0         2         3         4        5
-    // 23:59:59 Sun 31 Oct 2016 100°C 1000HPa
-
-    static uint8_t DataMode = 0;
+    DisplayState &display = displayState;
     uint8_t key;
 
     // index for tables with measurements
     static uint8_t dayNumber = 0;
     static unsigned long measurementNumber = 1;
 
-    static temp_t tempMin = +10000;
-    static temp_t tempMax = -10000;
-    static humi_t humiMin = +10000;
-    static humi_t humiMax = -10000;
-    static pres_t presMin = +10000;
-    static pres_t presMax = -10000;
-
     temp_t tempValue;
     pres_t presValue;
     humi_t humiValue;
     int intValue;
-
-    static temp_t averageTemp = 0;
-    static humi_t averageHumi = 0;
-    static pres_t averagePres = 0;
 
     textEffect_t textEffect;
     unsigned int infoTime;
@@ -916,9 +1174,6 @@ void loop() {
 
     static byte VAValue;
 
-    static String ParamS = DingOnOff ? "On" : "Off";
-
-
     if (SensorUpdate.check(MeasurementFreg)) {
 
       xSemaphoreTake(bufMutex, portMAX_DELAY);
@@ -928,14 +1183,14 @@ void loop() {
       _l = lightMeter.readLightLevel();
       xSemaphoreGive(bufMutex);
 
-      averageTemp = tempTable[dayNumber] + (_t - tempTable[dayNumber]) / measurementNumber;
-      tempTable[dayNumber] = averageTemp;
+      display.averageTemp = tempTable[dayNumber] + (_t - tempTable[dayNumber]) / measurementNumber;
+      tempTable[dayNumber] = display.averageTemp;
 
-      averagePres = presTable[dayNumber] + (_p - presTable[dayNumber]) / measurementNumber;
-      presTable[dayNumber] = averagePres;
+      display.averagePres = presTable[dayNumber] + (_p - presTable[dayNumber]) / measurementNumber;
+      presTable[dayNumber] = display.averagePres;
 
-      averageHumi = humiTable[dayNumber] + (_h - humiTable[dayNumber]) / measurementNumber;
-      humiTable[dayNumber] = averageHumi;
+      display.averageHumi = humiTable[dayNumber] + (_h - humiTable[dayNumber]) / measurementNumber;
+      humiTable[dayNumber] = display.averageHumi;
 
 
       //    PRINT("Day: ", dayNumber);
@@ -974,13 +1229,13 @@ void loop() {
     // check the light to setup matrix intensivity after a final write
     if (IntensityCheck.check(IntensityWait)) {
       uint16_t lux = lightMeter.readLightLevel();
-      intensity = IntensityMap(lux);
+      display.intensity = IntensityMap(lux);
       //PRINT("Light: ",lux);
       //PRINT(" lx  MAP:", intensity);
       //PRINTLN;
-      if (intensity != lintensity) {
+      if (display.intensity != display.lintensity) {
         //matrix.setIntensity(intensity);
-        lintensity = intensity;
+        display.lintensity = display.intensity;
       }
 
       // check and activate screen saver mode max7219 -> shutdown mode and (re)set screenSaverNotActive flag for matrix.write
@@ -1065,6 +1320,7 @@ void loop() {
         //          break;
 
       case _Clock_NTP_Sync:
+        clockReadyForRemoteMessages = false;
         printClockTimes("NTP resync start");
         if (StartSyncNTP()) {  // error by NTP sync
           zoneInfo0.setText("NTP Sync ERROR", _SCROLL_LEFT, _TO_FULL, InfoTick1, I0s, I0e);
@@ -1085,9 +1341,14 @@ void loop() {
 
       case _Clock_Temp_init:
         clearScreen();
+        clockReadyForRemoteMessages = false;
         StatTask.start();
-        tempMin = tempTable[0];
-        tempMax = tempTable[0];
+        display.tempMin = tempTable[0];
+        display.tempMax = tempTable[0];
+        display.presMin = presTable[0];
+        display.presMax = presTable[0];
+        display.humiMin = humiTable[0];
+        display.humiMax = humiTable[0];
         for (ptr = 0; ptr < dayNumber; ptr++) {
           tempValue = tempTable[ptr];
 
@@ -1096,32 +1357,33 @@ void loop() {
           //            PRINT("  max : ", tempMax);
           //            PRINTLN;
 
-          if (tempValue < tempMin) tempMin = tempValue;
-          if (tempValue > tempMax) tempMax = tempValue;
+          if (tempValue < display.tempMin) display.tempMin = tempValue;
+          if (tempValue > display.tempMax) display.tempMax = tempValue;
 
           presValue = presTable[ptr];
-          if (presValue < presMin) presMin = presValue;
-          if (presValue > presMax) presMax = presValue;
+          if (presValue < display.presMin) display.presMin = presValue;
+          if (presValue > display.presMax) display.presMax = presValue;
 
           humiValue = humiTable[ptr];
-          if (humiValue < humiMin) humiMin = humiValue;
-          if (humiValue > humiMax) humiMax = humiValue;
+          if (humiValue < display.humiMin) display.humiMin = humiValue;
+          if (humiValue > display.humiMax) display.humiMax = humiValue;
         }
-        if (tempMax - tempMin < 8) tempMax = tempMin + 8;
-        if (presMax - presMin < 8) presMax = presMin + 8;
-        if (humiMax - humiMin < 8) humiMax = humiMin + 8;
+        if (display.tempMax - display.tempMin < 8) display.tempMax = display.tempMin + 8;
+        if (display.presMax - display.presMin < 8) display.presMax = display.presMin + 8;
+        if (display.humiMax - display.humiMin < 8) display.humiMax = display.humiMin + 8;
 
         goBackState = _Clock_Temp_init;
         ClockState = _Clock_Temp;
-        DataMode = 0;
+        display.dataMode = 0;
         break;
 
       case _Clock_Temp:
+        clockReadyForRemoteMessages = true;
 
         if (StatTask.check(DiagramDelay)) {
           clearScreen();
           matrix.setCursor(0, 0);
-          switch (DataMode) {
+          switch (display.dataMode) {
             case 0:
               matrix.print("T");
               break;
@@ -1133,15 +1395,15 @@ void loop() {
               break;
           }
           for (ptr = 0; ptr <= dayNumber; ptr++) {
-            switch (DataMode) {
+            switch (display.dataMode) {
               case 0:
-                intValue = map(tempTable[ptr], tempMin, tempMax, 0, 8);
+                intValue = map(tempTable[ptr], display.tempMin, display.tempMax, 0, 8);
                 break;
               case 1:
-                intValue = map(presTable[ptr], presMin, presMax, 0, 8);
+                intValue = map(presTable[ptr], display.presMin, display.presMax, 0, 8);
                 break;
               case 2:
-                intValue = map(humiTable[ptr], humiMin, humiMax, 0, 8);
+                intValue = map(humiTable[ptr], display.humiMin, display.humiMax, 0, 8);
                 break;
             }
             intValue = constrain(intValue, 0, 8);
@@ -1154,38 +1416,79 @@ void loop() {
 
             matrix.drawFastVLine(ptr + ShiftDiagram, 8 - intValue, intValue, HIGH);
           }
-          updateDisplay = true;
+          display.updateDisplay = true;
         }
         if (keyboard(_Clock_menu_init, _Clock_simple_time_init, _Clock_none, _Clock_none) == SW_UP) {
-          DataMode = (DataMode + 1) % 3;
+          display.dataMode = (display.dataMode + 1) % 3;
           StatTask.check(-DiagramDelay);
+        }
+        break;
+
+      case _Clock_remote_message_init:
+        clearScreen();
+        clockReadyForRemoteMessages = false;
+        if (!takePendingRemoteMessage()) {
+          PRINTS("Remote Msg init without pending message\n");
+          ClockState = remoteMessageReturnState;
+          break;
+        }
+        PRINT("Remote Msg init: ", activeRemoteMessage);
+        PRINTLN;
+        DFPlayer.playFolder(3, 102);
+        startVoiceCoilMotion();
+        remoteMessageMotionActive = true;
+        RemoteMessageMotion.start();
+        zoneInfo0.setText(activeRemoteMessage, _SCROLL_LEFT, _TO_FULL, InfoQuick, I0s, I0e);
+        zoneInfo0.Animate(true);
+        remoteMessageWaitingForRepeat = false;
+        display.updateDisplay = true;
+        goBackState = remoteMessageReturnState;
+        ClockState = _Clock_remote_message;
+        break;
+
+      case _Clock_remote_message:
+        clockReadyForRemoteMessages = true;
+        display.updateDisplay |= zoneInfo0.Animate(false);
+        if (remoteMessageMotionActive) {
+          if (RemoteMessageMotion.check(RemoteMessageMotionMs)) {
+            remoteMessageMotionActive = false;
+            stopVoiceCoilMotion();
+          } else {
+            updateVoiceCoilMotion();
+          }
+        }
+        key = keyboard(_Clock_none, _Clock_none, _Clock_none, _Clock_none);
+        if (key == SW_DOWN) {
+          char acknowledgedMessage[sizeof(activeRemoteMessage)];
+          xSemaphoreTake(messageMutex, portMAX_DELAY);
+          strncpy(acknowledgedMessage, activeRemoteMessage, sizeof(acknowledgedMessage) - 1);
+          acknowledgedMessage[sizeof(acknowledgedMessage) - 1] = '\0';
+          remoteMessageActive = false;
+          activeRemoteMessage[0] = '\0';
+          xSemaphoreGive(messageMutex);
+          queueRemoteMessageAck(acknowledgedMessage);
+          remoteMessageWaitingForRepeat = false;
+          remoteMessageMotionActive = false;
+          stopVoiceCoilMotion();
+          ClockState = remoteMessageReturnState;
+        } else if (zoneInfo0.AnimateDone()) {
+          if (!remoteMessageWaitingForRepeat) {
+            RemoteMessageRepeat.start();
+            remoteMessageWaitingForRepeat = true;
+          } else if (RemoteMessageRepeat.check(RemoteMessageRepeatDelay)) {
+            zoneInfo0.Reset();
+            remoteMessageWaitingForRepeat = false;
+            display.updateDisplay = true;
+          }
         }
         break;
 
       case _Clock_simple_time_init:
 
         clearScreen();
+        clockReadyForRemoteMessages = false;
         LocalTime = CET.toLocal(now());
-        valueH = hour(LocalTime);
-        valueM = minute(LocalTime);
-        valueS = second(LocalTime);
-        lvalueH = valueH;
-        lvalueM = valueM;
-        lvalueS = valueS;
-
-        matrix.drawChar(H1s, 0, (char)('0' + valueH / 10), HIGH, LOW, 1);
-        matrix.drawChar(H0s, 0, (char)('0' + valueH % 10), HIGH, LOW, 1);
-        matrix.drawChar(M1s, 0, (char)('0' + valueM / 10), HIGH, LOW, 1);
-        matrix.drawChar(M0s, 0, (char)('0' + valueM % 10), HIGH, LOW, 1);
-        matrix.drawChar(S1s, 0, (char)('0' + valueS / 10), HIGH, LOW, 1);
-        matrix.drawChar(S0s, 0, (char)('0' + valueS % 10), HIGH, LOW, 1);
-        matrix.drawPixel(M0e + 1, 0, HIGH);
-        matrix.drawPixel(M0e + 1, 1, HIGH);
-        matrix.drawPixel(H0e + 1, 2, HIGH);
-        matrix.drawPixel(H0e + 1, 5, HIGH);
-        matrix.drawPixel(H0e + 1, 7, SyncNTPError || !digitalRead(modePin));  // indicate if NTP sync error
-
-        updateDisplay = true;
+        initSimpleTimeDisplay(display, matrix, LocalTime, SyncNTPError, digitalRead(modePin));
 
         //IntensityCheck.start();
         SnakeUpdate.start();
@@ -1200,27 +1503,15 @@ void loop() {
         break;
 
       case _Clock_simple_time:
+        clockReadyForRemoteMessages = true;
         LocalTime = CET.toLocal(now());
-        updateTtime(valueH, lvalueH, hour(LocalTime), 'H');
-        updateTtime(valueM, lvalueM, minute(LocalTime), 'M');
-        if (updateTtime(valueS, lvalueS, second(LocalTime), 'S')) {
-          //            flasher = !flasher;
-          //            digitalWrite(sledPin, flasher);
-          updateDisplay = true;
-          // PRINTS(digitalClockString());
-        }
-        updateDisplay |= zoneClockH0.Animate(false);
-        updateDisplay |= zoneClockH1.Animate(false);
-        updateDisplay |= zoneClockM0.Animate(false);
-        updateDisplay |= zoneClockM1.Animate(false);
+        updateSimpleTimeDisplay(display, LocalTime, zoneClockH0, zoneClockH1, zoneClockM0, zoneClockM1, zoneClockS0, zoneClockS1);
         updateVoiceCoilMotion();
-        updateDisplay |= zoneClockS1.Animate(false);
-        updateDisplay |= zoneClockS0.Animate(false);
 
         // Snake animation
         if (SnakeUpdate.check(SnakeWait) || SnakeState == _sRunA) {
           matrix.setClip(SNs, SNe, 0, 8);
-          updateDisplay = true;
+          display.updateDisplay = true;
           switch (SnakeState) {
             case _sInit:
               //                        PRINTS("\n Init");
@@ -1290,7 +1581,7 @@ void loop() {
               break;
             case _sFail:
               //                        PRINTS("\n Fail");
-              dacWrite(DACVoiceCoil, 0);
+              stopVoiceCoilMotion();
               SnakeState = _sInit;
               break;
           }
@@ -1301,50 +1592,38 @@ void loop() {
 
       case _Clock_menu_init:
         clearScreen();
+        clockReadyForRemoteMessages = false;
         zoneInfo0.setText("Ding:", _SCROLL_RIGHT, _TO_LEFT, InfoTick, I0s, I0e);
         zoneInfo0.Animate(true);
-        updateDisplay = false;
+        display.updateDisplay = false;
         goBackState = _Clock_menu_init;
         ClockState = _Clock_menu;
-        DataMode = 0;
+        display.dataMode = 0;
         zoneInfo0.setText("Ding:", _PRINT, _NONE_MOD, InfoTick, MEs, MEe);
-        zoneInfo1.setText(ParamS, _BLINK, _NONE_MOD, InfoSlow, PAs, PAe);
+        display.paramS = DingOnOff ? "On" : "Off";
+        zoneInfo1.setText(display.paramS, _BLINK, _NONE_MOD, InfoSlow, PAs, PAe);
         break;
 
       case _Clock_menu:
-        updateDisplay = zoneInfo1.Animate(false);
+        clockReadyForRemoteMessages = true;
+        display.updateDisplay = zoneInfo1.Animate(false);
         if (keyboard(_Clock_complete_info_init, _Clock_Temp_init, _Clock_none, _Clock_none) == SW_UP) {
           DingOnOff = !(DingOnOff);
-          ParamS = DingOnOff ? "On" : "Off";
-          zoneInfo1.setText(ParamS, _BLINK, _NONE_MOD, InfoSlow, PAs, PAe);
+          display.paramS = DingOnOff ? "On" : "Off";
+          zoneInfo1.setText(display.paramS, _BLINK, _NONE_MOD, InfoSlow, PAs, PAe);
           savePreferences();
-          updateDisplay = true;
+          display.updateDisplay = true;
         }
         break;
 
       case _Clock_complete_info_init:
 
         clearScreen();
+        clockReadyForRemoteMessages = false;
         LocalTime = CET.toLocal(now());
-        valueH = hour(LocalTime);
-        valueM = minute(LocalTime);
-        valueS = second(LocalTime);
-        lvalueH = valueH;
-        lvalueM = valueM;
-        lvalueS = valueS;
+        initCompleteInfoDisplay(display, matrix, LocalTime, SyncNTPError, digitalRead(modePin));
 
-        matrix.drawChar(H1s, 0, (char)('0' + valueH / 10), HIGH, LOW, 1);
-        matrix.drawChar(H0s, 0, (char)('0' + valueH % 10), HIGH, LOW, 1);
-        matrix.drawChar(M1s, 0, (char)('0' + valueM / 10), HIGH, LOW, 1);
-        matrix.drawChar(M0s, 0, (char)('0' + valueM % 10), HIGH, LOW, 1);
-        matrix.drawPixel(H0e + 1, 7, SyncNTPError);  // indicate if NTP sync error
-        PRINT("SyncNTPError =", SyncNTPError);
-        PRINT("   Mode =", digitalRead(modePin));
-        PRINTLN;
-
-        updateDisplay = true;
-
-        DataMode = 0;
+        display.dataMode = 0;
         DataDisplayTask.start(-2000);
 
         //IntensityCheck.start();
@@ -1356,83 +1635,71 @@ void loop() {
         break;
 
       case _Clock_complete_info:
+        clockReadyForRemoteMessages = true;
 
         // PRINTS("Complete Info\n");
         LocalTime = CET.toLocal(now());
-        updateTtime(valueH, lvalueH, hour(LocalTime), 'H');
-        updateTtime(valueM, lvalueM, minute(LocalTime), 'M');
-        if (updateTtime(valueS, lvalueS, second(LocalTime), 'S')) {
-          flasher = !flasher;
-          // digitalWrite(sledPin, flasher);
-          updateDisplay = true;
-          matrix.setClip(H0e + 1, H0e + 2, 0, 8);
-          matrix.drawPixel(H0e + 1, 2, flasher);
-          matrix.drawPixel(H0e + 1, 5, flasher);
-        }
-        updateDisplay |= zoneClockH0.Animate(false);
-        updateDisplay |= zoneClockH1.Animate(false);
-        updateDisplay |= zoneClockM0.Animate(false);
-        updateDisplay |= zoneClockM1.Animate(false);
+        updateCompleteInfoClock(display, matrix, LocalTime, zoneClockH0, zoneClockH1, zoneClockM0, zoneClockM1);
 
         if (DataDisplayTask.check(FullInfoDelay)) {
-          switch (DataMode) {
+          switch (display.dataMode) {
             case 0:
-              sprintf(DataStr, "%s%02d", monthShortStr(month(LocalTime)), day(LocalTime));
+              sprintf(display.dataStr, "%s%02d", monthShortStr(month(LocalTime)), day(LocalTime));
               textEffect = _SCROLL_LEFT;
               break;
             case 1:
-              sprintf(DataStr, "%s%02d", dayShortStr(weekday(LocalTime)), day(LocalTime));
+              sprintf(display.dataStr, "%s%02d", dayShortStr(weekday(LocalTime)), day(LocalTime));
               textEffect = _SCROLL_LEFT;
               break;
             case 99:
-              sprintf(DataStr, "%s", monthStr(month(LocalTime)));
+              sprintf(display.dataStr, "%s", monthStr(month(LocalTime)));
               textEffect = _SCROLL_LEFT;
               break;
             case 2:
               // sprintf (DataStr, "%c%d%c", 160, (int)(mySensor.readTemperature()+0.5), 161);
               tempValue = round(mySensor.readTemperature());
-              sprintf(DataStr, "%d%c", (int)(tempValue), GLYPH_DEGREE);
-              textEffect = tempValue > round(averageTemp) ? _SCROLL_UP : tempValue < round(averageTemp) ? _SCROLL_DOWN
+              sprintf(display.dataStr, "%d%c", (int)(tempValue), GLYPH_DEGREE);
+              textEffect = tempValue > round(display.averageTemp) ? _SCROLL_UP : tempValue < round(display.averageTemp) ? _SCROLL_DOWN
                                                                                                         : _SCROLL_LEFT;
               break;
             case 3:
               //sprintf (DataStr, "%c%.0f%c", 162, mySensor.readPressure() / 100.0F, 163);
 
               presValue = round(mySensor.readPressure() / 100.0F);
-              sprintf(DataStr, "%.0f%c", presValue, GLYPH_HPA);
-              textEffect = presValue > round(averagePres) ? _SCROLL_UP : presValue < round(averagePres) ? _SCROLL_DOWN
+              sprintf(display.dataStr, "%.0f%c", presValue, GLYPH_HPA);
+              textEffect = presValue > round(display.averagePres) ? _SCROLL_UP : presValue < round(display.averagePres) ? _SCROLL_DOWN
                                                                                                         : _SCROLL_LEFT;
               //textEffect = _SCROLL_LEFT;
               break;
             case 4:
               //sprintf (DataStr, "%c%d%%", 166, (int)(mySensor.readHumidity()+0.5));
               humiValue = round(mySensor.readHumidity());
-              sprintf(DataStr, "%d%%", (int)(humiValue));
+              sprintf(display.dataStr, "%d%%", (int)(humiValue));
 
               //                 PRINT("Day:", dayNumber);
               //                 PRINT("  Srednia:", round(averageHumi));
               //                 PRINT("  Sensor: ", humiValue)
               //                 PRINTLN;
 
-              textEffect = humiValue > round(averageHumi) ? _SCROLL_UP : humiValue < round(averageHumi) ? _SCROLL_DOWN
+              textEffect = humiValue > round(display.averageHumi) ? _SCROLL_UP : humiValue < round(display.averageHumi) ? _SCROLL_DOWN
                                                                                                         : _SCROLL_LEFT;
               //textEffect = _SCROLL_LEFT;
               break;
             case 6:
               int measurement = hallRead();
               PRINT("Hall sensor measurement: ", measurement);
-              sprintf(DataStr, "H:%02d", measurement);
+              sprintf(display.dataStr, "H:%02d", measurement);
               textEffect = _SCROLL_LEFT;
               break;
           }
 
           infoTime = textEffect == _SCROLL_LEFT ? InfoQuick : InfoSlow;
-          zoneInfo1.setText(DataStr, textEffect, _TO_LEFT, infoTime, I1s, I1e);
-          DataMode = (DataMode + 1) % 5;
+          zoneInfo1.setText(display.dataStr, textEffect, _TO_LEFT, infoTime, I1s, I1e);
+          display.dataMode = (display.dataMode + 1) % 5;
         }
-        updateDisplay |= zoneInfo1.Animate(false);
+        display.updateDisplay |= zoneInfo1.Animate(false);
         if (keyboard(_Clock_simple_time_init, _Clock_menu_init, _Clock_none, _Clock_none) == SW_UP) {
-          DataMode = (DataMode + 1) % 5;
+          display.dataMode = (display.dataMode + 1) % 5;
           DataDisplayTask.start(-FullInfoDelay);
         }
         break;
@@ -1443,13 +1710,20 @@ void loop() {
       default:;
     }
 
+    if (clockReadyForRemoteMessages && hasPendingRemoteMessage()) {
+      remoteMessageReturnState = normalizeClockStateForReturn(ClockState);
+      PRINT("Remote Msg takeover from state ", remoteMessageReturnState);
+      PRINTLN;
+      ClockState = _Clock_remote_message_init;
+    }
 
-    if (updateDisplay) {
+
+    if (display.updateDisplay) {
       if (screenSaverNotActive) {
         matrix.write();
-        matrix.setIntensity(intensity);
+        matrix.setIntensity(display.intensity);
       }
-      updateDisplay = false;
+      display.updateDisplay = false;
     }
   }
 }
@@ -1489,9 +1763,9 @@ void processEncoder() {
 
 
 void taskMQTT(void *parameter) {
-
-  const TickType_t xTicksToWait = pdMS_TO_TICKS(Time2UpdateMQTT);
+  const TickType_t xTicksToWait = pdMS_TO_TICKS(250);
   float _tt, _hh, _pp, _ll;
+  unsigned long lastPublishAt = 0;
 
   UBaseType_t uxHighWaterMark;
 
@@ -1499,24 +1773,35 @@ void taskMQTT(void *parameter) {
     uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
     // Serial.print("\nStack IN:"); Serial.println(uxHighWaterMark);
     vTaskDelay(xTicksToWait);
-    PRINTS("MQTT publishing\n");
     if (MQTT_connect()) {
-      xSemaphoreTake(bufMutex, portMAX_DELAY);
-      _tt = _t;
-      _hh = _h;
-      _pp = _p;
-      _ll = _l;
-      xSemaphoreGive(bufMutex);
-      tempMQTT.publish(_tt);
-      humiMQTT.publish(_hh);
-      presMQTT.publish(_pp);
-      brigMQTT.publish(_ll);
-      dataMQTT.publish(lastTime.c_str());
-      onofMQTT.publish(screenSaverNotActive ? 1 : 0);
-      //      PRINT("P", _p); PRINTLN;
-      //      PRINT("H", _h ); PRINTLN;
-      //      PRINT("T", _t ); PRINTLN;
-      //      PRINT("L", _l ); PRINTLN;
+      Adafruit_MQTT_Subscribe *subscription;
+      while ((subscription = mqtt.readSubscription(10))) {
+        if (subscription == &msgMQTTSub) {
+          queueRemoteMessage((char *)msgMQTTSub.lastread);
+          PRINT("MQTT message: ", (char *)msgMQTTSub.lastread);
+          PRINTLN;
+        }
+      }
+
+      publishQueuedRemoteMessageAck();
+      publishQueuedRemoteMessageClear();
+
+      if (millis() - lastPublishAt >= Time2UpdateMQTT) {
+        PRINTS("MQTT publishing\n");
+        xSemaphoreTake(bufMutex, portMAX_DELAY);
+        _tt = _t;
+        _hh = _h;
+        _pp = _p;
+        _ll = _l;
+        xSemaphoreGive(bufMutex);
+        tempMQTT.publish(_tt);
+        humiMQTT.publish(_hh);
+        presMQTT.publish(_pp);
+        brigMQTT.publish(_ll);
+        dataMQTT.publish(lastTime.c_str());
+        onofMQTT.publish(screenSaverNotActive ? 1 : 0);
+        lastPublishAt = millis();
+      }
     }
     uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
     // Serial.print("\nStack OUT:"); Serial.println(uxHighWaterMark);
@@ -1527,6 +1812,9 @@ void taskMQTT(void *parameter) {
 // Should be called in the loop function and it will take care if connecting.
 boolean MQTT_connect() {
   int8_t ret;
+
+  mqtt.subscribe(&ledMQTT);
+  mqtt.subscribe(&msgMQTTSub);
 
   // Stop if already connected.
   if (mqtt.connected()) {

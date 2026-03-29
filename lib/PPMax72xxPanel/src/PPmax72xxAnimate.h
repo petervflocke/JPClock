@@ -1,3 +1,5 @@
+#pragma once
+
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <PPMax72xxPanel.h>

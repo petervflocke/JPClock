@@ -140,6 +140,7 @@ boolean PPmax72xxAnimate::Animate(boolean _loop) {
             // _fsmState = _END;
             break;
           case _SCROLL_LEFT:
+            _PPMax->fillScreen(LOW);
             if ( (_x > _xClipS && _textEffectMod == _TO_LEFT) || ( _x+_tapeWidth > _xClipE && _textEffectMod == _TO_RIGHT) || (_x+_tapeWidth > _xClipS && _textEffectMod == _TO_FULL) ) {
               _PPMax->setCursor(_x,_y);
               _PPMax->print(_tape);
@@ -151,6 +152,7 @@ boolean PPmax72xxAnimate::Animate(boolean _loop) {
             }
             break;
           case _SCROLL_RIGHT:
+            _PPMax->fillScreen(LOW);
             if ( (_x < _xClipS && _textEffectMod == _TO_LEFT) || ( _x+_tapeWidth < _xClipE && _textEffectMod == _TO_RIGHT) || (_x < _xClipE && _textEffectMod == _TO_FULL) ) {
               _PPMax->setCursor(_x,_y);
               _PPMax->print(_tape);
