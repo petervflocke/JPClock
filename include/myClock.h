@@ -124,6 +124,10 @@ typedef float pres_t;
 // define freq. to update MQTT/IOT page in seconds
 #define Time2UpdateMQTT 60000
 
+// Custom 5x7 glyphs stored in PPMax72xxPanel/src/customglcdfont.c
+#define GLYPH_DEGREE 135
+#define GLYPH_HPA    136
+
 // IOT defines
 
 #define feedTemp "/feeds/temperature"
