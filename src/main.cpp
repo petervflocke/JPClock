@@ -103,6 +103,7 @@ Schedular ChimeWait(_Millis);        // time to wait after 4 quarter chime
 Schedular UpdateMQTT(_Seconds);      // Frequency of updating IOT
 Schedular RemoteMessageRepeat(_Millis);
 Schedular RemoteMessageMotion(_Millis);
+Schedular DisplayOffFade(_Millis);
 
 // MP3 Player
 HardwareSerial DFPSerial(1);
@@ -171,10 +172,12 @@ bool fetchLastRemoteMessage(String &message);
 String extractJsonStringField(const String &json, const char *fieldName);
 bool isRemoteMessageEmpty(const char *message);
 bool isRemoteMessageEmpty(const String &message);
+void wakeDisplayToMenu(DisplayState &display);
 
 
 //globals for screensaver status main loop and MQTT updates
 bool screenSaverNotActive = true;
+bool displayEnabled = true;
 String lastTime = "";
 char currentTimezoneAbbrev[6] = "";
 bool timezoneStateKnown = false;
@@ -198,6 +201,7 @@ ClockStates remoteMessageReturnState = _Clock_complete_info_init;
 // Parameter section, just one for the time being
 Preferences preferences;
 boolean DingOnOff = true;
+uint8_t displayFadeIntensity = 0;
 
 
 // PWM data for HDD voice coil
@@ -271,12 +275,28 @@ ClockStates normalizeClockStateForReturn(ClockStates state) {
     case _Clock_menu_init:
     case _Clock_menu:
       return _Clock_menu_init;
+    case _Clock_menu_display_init:
+    case _Clock_menu_display:
+      return _Clock_menu_display_init;
+    case _Clock_display_off_init:
+    case _Clock_display_off:
+      return _Clock_display_off_init;
     case _Clock_remote_message_init:
     case _Clock_remote_message:
       return remoteMessageReturnState;
     default:
       return _Clock_complete_info_init;
   }
+}
+
+void wakeDisplayToMenu(DisplayState &display) {
+  displayEnabled = true;
+  matrix.shutdown(false);
+  display.intensity = IntensityMap(lightMeter.readLightLevel());
+  display.lintensity = display.intensity;
+  matrix.setIntensity(display.intensity);
+  screenSaverNotActive = true;
+  ClockState = _Clock_menu_display_init;
 }
 
 void queueRemoteMessage(const char *message) {
@@ -1238,31 +1258,38 @@ void loop() {
         display.lintensity = display.intensity;
       }
 
-      // check and activate screen saver mode max7219 -> shutdown mode and (re)set screenSaverNotActive flag for matrix.write
-      if (digitalRead(pirPin)) {
-        ScreenSaver.start();
-        digitalWrite(sledPin, LOW);
-        matrix.shutdown(false);
-        screenSaverNotActive = true;
-        lastTime = digitalClockString();
-        lastTimeMove = millis();
-        // dacWrite(DACVoiceCoil, voiceCoilMax);
+      // The manual display-off mode must stay dark regardless of PIR motion.
+      if (!displayEnabled) {
+        digitalWrite(sledPin, HIGH);
+        matrix.shutdown(true);
+        screenSaverNotActive = false;
       } else {
-        if (ScreenSaver.check(ScreenTimeOut)) {
-          digitalWrite(sledPin, HIGH);
-          matrix.shutdown(true);
-          screenSaverNotActive = false;
-          // dacWrite(DACVoiceCoil, voiceCoilMin);
-          PRINTS("ScreenSaver ON");
+        // check and activate screen saver mode max7219 -> shutdown mode and (re)set screenSaverNotActive flag for matrix.write
+        if (digitalRead(pirPin)) {
+          ScreenSaver.start();
+          digitalWrite(sledPin, LOW);
+          matrix.shutdown(false);
+          screenSaverNotActive = true;
+          lastTime = digitalClockString();
+          lastTimeMove = millis();
+          // dacWrite(DACVoiceCoil, voiceCoilMax);
         } else {
-          voiceCoilDeta = (unsigned long)(millis() - lastTimeMove);
-          if (voiceCoilDeta <= ScreenTimeOut * 1000 && screenSaverNotActive) {
-            //          PRINT("Delta:", voiceCoilDeta);
-            //          PRINTLN;
-            //          PRINT("Map  :", map(voiceCoilDeta, 0, ScreenTimeOut*1000, 90, 60));
-            //          PRINTLN;
-            //dacWrite(DACVoiceCoil, map(voiceCoilDeta, 0, ScreenTimeOut * 1000, voiceCoilMax, voiceCoilMin));
-            ;
+          if (ScreenSaver.check(ScreenTimeOut)) {
+            digitalWrite(sledPin, HIGH);
+            matrix.shutdown(true);
+            screenSaverNotActive = false;
+            // dacWrite(DACVoiceCoil, voiceCoilMin);
+            PRINTS("ScreenSaver ON");
+          } else {
+            voiceCoilDeta = (unsigned long)(millis() - lastTimeMove);
+            if (voiceCoilDeta <= ScreenTimeOut * 1000 && screenSaverNotActive) {
+              //          PRINT("Delta:", voiceCoilDeta);
+              //          PRINTLN;
+              //          PRINT("Map  :", map(voiceCoilDeta, 0, ScreenTimeOut*1000, 90, 60));
+              //          PRINTLN;
+              //dacWrite(DACVoiceCoil, map(voiceCoilDeta, 0, ScreenTimeOut * 1000, voiceCoilMax, voiceCoilMin));
+              ;
+            }
           }
         }
       }
@@ -1568,12 +1595,14 @@ void loop() {
                 continueLoop = occupied(nextPtr, snakeLength, snakeX, snakeY);
               }
               if (attempt == SnakeAttempt) {
+                stopVoiceCoilMotion();
                 matrix.fillScreen(HIGH);
                 SnakeState = _sFail;
               } else {
                 snakeRound = (snakeRound + 1) % SankeNextRound;
                 if (snakeRound == 0) snakeLength = snakeLength + 1;
                 if (snakeLength >= MaxSnake) {
+                  stopVoiceCoilMotion();
                   matrix.fillScreen(HIGH);
                   SnakeState = _sFail;
                 } else SnakeState = _sRunA;
@@ -1598,7 +1627,6 @@ void loop() {
         display.updateDisplay = false;
         goBackState = _Clock_menu_init;
         ClockState = _Clock_menu;
-        display.dataMode = 0;
         zoneInfo0.setText("Ding:", _PRINT, _NONE_MOD, InfoTick, MEs, MEe);
         display.paramS = DingOnOff ? "On" : "Off";
         zoneInfo1.setText(display.paramS, _BLINK, _NONE_MOD, InfoSlow, PAs, PAe);
@@ -1607,12 +1635,70 @@ void loop() {
       case _Clock_menu:
         clockReadyForRemoteMessages = true;
         display.updateDisplay = zoneInfo1.Animate(false);
-        if (keyboard(_Clock_complete_info_init, _Clock_Temp_init, _Clock_none, _Clock_none) == SW_UP) {
-          DingOnOff = !(DingOnOff);
+        if (keyboard(_Clock_menu_display_init, _Clock_Temp_init, _Clock_none, _Clock_none) == SW_UP) {
+          DingOnOff = !DingOnOff;
           display.paramS = DingOnOff ? "On" : "Off";
           zoneInfo1.setText(display.paramS, _BLINK, _NONE_MOD, InfoSlow, PAs, PAe);
           savePreferences();
           display.updateDisplay = true;
+        }
+        break;
+
+      case _Clock_menu_display_init:
+        clearScreen();
+        clockReadyForRemoteMessages = false;
+        zoneInfo0.setText("LED:", _SCROLL_RIGHT, _TO_LEFT, InfoTick, I0s, I0e);
+        zoneInfo0.Animate(true);
+        display.updateDisplay = false;
+        goBackState = _Clock_menu_display_init;
+        ClockState = _Clock_menu_display;
+        zoneInfo0.setText("LED:", _PRINT, _NONE_MOD, InfoTick, MEs, MEe);
+        display.paramS = displayEnabled ? "On" : "Off";
+        zoneInfo1.setText(display.paramS, _BLINK, _NONE_MOD, InfoSlow, PAs, PAe);
+        break;
+
+      case _Clock_menu_display:
+        clockReadyForRemoteMessages = true;
+        display.updateDisplay = zoneInfo1.Animate(false);
+        if (keyboard(_Clock_complete_info_init, _Clock_menu_init, _Clock_none, _Clock_none) == SW_UP) {
+          if (displayEnabled) {
+            display.paramS = "Off";
+            zoneInfo1.setText(display.paramS, _BLINK, _NONE_MOD, InfoSlow, PAs, PAe);
+            display.updateDisplay = true;
+            ClockState = _Clock_display_off_init;
+          }
+        }
+        break;
+
+      case _Clock_display_off_init:
+        clockReadyForRemoteMessages = true;
+        stopVoiceCoilMotion();
+        displayEnabled = false;
+        displayFadeIntensity = display.lintensity;
+        if (displayFadeIntensity > display.intensity) displayFadeIntensity = display.intensity;
+        matrix.setIntensity(displayFadeIntensity);
+        DisplayOffFade.start();
+        ClockState = _Clock_display_off;
+        break;
+
+      case _Clock_display_off:
+        clockReadyForRemoteMessages = true;
+        key = keyboard(_Clock_none, _Clock_none, _Clock_none, _Clock_none);
+        if (key == SW_UP || key == DIR_CW || key == DIR_CCW) {
+          wakeDisplayToMenu(display);
+          break;
+        }
+        if (DisplayOffFade.check(90)) {
+          if (displayFadeIntensity > 0) {
+            displayFadeIntensity--;
+            matrix.setIntensity(displayFadeIntensity);
+            matrix.write();
+          } else {
+            matrix.fillScreen(LOW);
+            matrix.write();
+            matrix.shutdown(true);
+            screenSaverNotActive = false;
+          }
         }
         break;
 
@@ -1698,7 +1784,7 @@ void loop() {
           display.dataMode = (display.dataMode + 1) % 5;
         }
         display.updateDisplay |= zoneInfo1.Animate(false);
-        if (keyboard(_Clock_simple_time_init, _Clock_menu_init, _Clock_none, _Clock_none) == SW_UP) {
+        if (keyboard(_Clock_simple_time_init, _Clock_menu_display_init, _Clock_none, _Clock_none) == SW_UP) {
           display.dataMode = (display.dataMode + 1) % 5;
           DataDisplayTask.start(-FullInfoDelay);
         }
@@ -1719,7 +1805,7 @@ void loop() {
 
 
     if (display.updateDisplay) {
-      if (screenSaverNotActive) {
+      if (displayEnabled && screenSaverNotActive) {
         matrix.write();
         matrix.setIntensity(display.intensity);
       }
