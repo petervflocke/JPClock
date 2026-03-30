@@ -8,5 +8,6 @@ pics/*.jpg
 pics/*.c
 pics/.png
 include/credentials.h
+AGENTS.md
 
 

@@ -94,6 +94,9 @@ typedef float pres_t;
 #define SankeNextRound 10
 #define pinRandom 32
 #define SnakeWait 50
+#define SkyStarsMax 4
+#define SkyStarsWaitMin 180
+#define SkyStarsWaitMax 650
 
 /* Digit animation speed for clock transitions. */
 #define ClockAnimTick 95
@@ -176,6 +179,8 @@ enum ClockStates
    _Clock_menu,
    _Clock_menu_display_init,
    _Clock_menu_display,
+   _Clock_sky_stars_init,
+   _Clock_sky_stars,
    _Clock_display_off_init,
    _Clock_display_off,
    _Clock_Temp_init,

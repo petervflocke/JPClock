@@ -38,6 +38,7 @@
 #include <PPmax72xxAnimate.h>
 #include <myScheduler.h>
 #include <Preferences.h>
+#include "sky_stars_mode.h"
 
 boolean wpsNeeded;
 String sWIFI_SSID;
@@ -202,6 +203,7 @@ ClockStates remoteMessageReturnState = _Clock_complete_info_init;
 Preferences preferences;
 boolean DingOnOff = true;
 uint8_t displayFadeIntensity = 0;
+SkyStarsMode skyStarsMode;
 
 
 // PWM data for HDD voice coil
@@ -278,6 +280,9 @@ ClockStates normalizeClockStateForReturn(ClockStates state) {
     case _Clock_menu_display_init:
     case _Clock_menu_display:
       return _Clock_menu_display_init;
+    case _Clock_sky_stars_init:
+    case _Clock_sky_stars:
+      return _Clock_sky_stars_init;
     case _Clock_display_off_init:
     case _Clock_display_off:
       return _Clock_display_off_init;
@@ -1660,7 +1665,7 @@ void loop() {
       case _Clock_menu_display:
         clockReadyForRemoteMessages = true;
         display.updateDisplay = zoneInfo1.Animate(false);
-        if (keyboard(_Clock_complete_info_init, _Clock_menu_init, _Clock_none, _Clock_none) == SW_UP) {
+        if (keyboard(_Clock_sky_stars_init, _Clock_menu_init, _Clock_none, _Clock_none) == SW_UP) {
           if (displayEnabled) {
             display.paramS = "Off";
             zoneInfo1.setText(display.paramS, _BLINK, _NONE_MOD, InfoSlow, PAs, PAe);
@@ -1668,6 +1673,21 @@ void loop() {
             ClockState = _Clock_display_off_init;
           }
         }
+        break;
+
+      case _Clock_sky_stars_init:
+        clearScreen();
+        clockReadyForRemoteMessages = false;
+        skyStarsMode.init(matrix);
+        display.updateDisplay = true;
+        goBackState = ClockState;
+        ClockState = _Clock_sky_stars;
+        break;
+
+      case _Clock_sky_stars:
+        clockReadyForRemoteMessages = true;
+        display.updateDisplay |= skyStarsMode.update(matrix);
+        key = keyboard(_Clock_complete_info_init, _Clock_menu_display_init, _Clock_none, _Clock_none);
         break;
 
       case _Clock_display_off_init:
@@ -1784,7 +1804,7 @@ void loop() {
           display.dataMode = (display.dataMode + 1) % 5;
         }
         display.updateDisplay |= zoneInfo1.Animate(false);
-        if (keyboard(_Clock_simple_time_init, _Clock_menu_display_init, _Clock_none, _Clock_none) == SW_UP) {
+        if (keyboard(_Clock_simple_time_init, _Clock_sky_stars_init, _Clock_none, _Clock_none) == SW_UP) {
           display.dataMode = (display.dataMode + 1) % 5;
           DataDisplayTask.start(-FullInfoDelay);
         }

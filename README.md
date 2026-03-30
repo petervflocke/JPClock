@@ -10,8 +10,12 @@ The implementation in [src/main.cpp](/home/peter/Development/platformio/JPClock/
 
 - `complete info`: main clock view with animated hours/minutes and a rotating info line
 - `simple time`: full `HH:MM:SS` display plus a snake animation on the right side of the matrix
-- `menu`: toggle the chime function on or off
+- `menu`: `Ding` entry used to toggle the chime function on or off
+- `menu_display`: `LED` entry used to control manual display-off
+- `SkyStars`: decorative black-screen star field with bursty star timing, uneven lifetimes, irregular twinkle, and a rare comet
+- `display_off`: fade-to-black/manual dark state that wakes back to the LED entry
 - `temp`: graph view for temperature, pressure, and humidity history
+- `remote message`: temporary takeover mode for MQTT-delivered messages
 - `NTP sync`: background/manual resynchronization state
 
 The info line in `complete info` cycles through:
@@ -86,10 +90,19 @@ If an NTP sync fails, the firmware retries more aggressively by reducing the res
 
 The rotary encoder/button is used to move between views:
 
-- In `complete info`, clockwise goes to `simple time`, counter-clockwise goes to `menu`, and button release advances the info line immediately.
-- In `simple time`, clockwise goes to `menu` and counter-clockwise goes to `complete info`.
-- In `menu`, clockwise goes to `complete info`, counter-clockwise goes to `temp`, and button release toggles hourly/quarter chime on or off.
-- In `temp`, clockwise goes to `menu`, counter-clockwise goes to `simple time`, and button release switches between temperature, pressure, and humidity graphs.
+- In `complete info`, clockwise goes to `simple time`, counter-clockwise goes to `LED`, and button release advances the info line immediately.
+- In `simple time`, clockwise goes to `temp` and counter-clockwise goes to `complete info`.
+- In `temp`, clockwise goes to `Ding` and counter-clockwise goes to `simple time`, and button release switches between temperature, pressure, and humidity graphs.
+- In `Ding`, clockwise goes to `LED`, counter-clockwise goes to `temp`, and button release toggles hourly/quarter chime on or off.
+- In `LED`, clockwise goes to `SkyStars`, counter-clockwise goes to `Ding`, and button release starts the manual display-off fade.
+- In `SkyStars`, clockwise goes to `complete info` and counter-clockwise goes to `LED`.
+- In `display off`, any rotary movement or button release wakes the panel and returns to the `LED` entry.
+
+The current clockwise loop in code is:
+
+- `complete info -> simple time -> temp -> Ding -> LED -> SkyStars -> complete info`
+
+`SkyStars` uses a black background across the full matrix, keeps at most four stars active at once, varies the delay between new stars, lets some stars disappear quickly while others linger, makes one star twinkle irregularly, and occasionally sends a comet across the display.
 
 ## Audio / Chimes
 
@@ -123,7 +136,9 @@ The MQTT update task runs every `60000` ms and sends the last measured sensor va
 ## Project Layout
 
 - [src/main.cpp](/home/peter/Development/platformio/JPClock/src/main.cpp): main firmware, state machine, networking, OTA, sensors, display logic
+- [src/sky_stars_mode.cpp](/home/peter/Development/platformio/JPClock/src/sky_stars_mode.cpp): dedicated `SkyStars` animation logic
 - [include/myClock.h](/home/peter/Development/platformio/JPClock/include/myClock.h): pinout, timing constants, feed names, state enums
+- [include/sky_stars_mode.h](/home/peter/Development/platformio/JPClock/include/sky_stars_mode.h): `SkyStars` mode interface and private state container
 - [include/credentials.h](/home/peter/Development/platformio/JPClock/include/credentials.h): local credentials and Adafruit IO keys used by the current build
 - [lib/myScheduler/src/myScheduler.h](/home/peter/Development/platformio/JPClock/lib/myScheduler/src/myScheduler.h): lightweight periodic scheduler helper
 - [lib/PPMax72xxPanel/](/home/peter/Development/platformio/JPClock/lib/PPMax72xxPanel): local fork of the MAX72xx panel library with clipping and scrolling support
