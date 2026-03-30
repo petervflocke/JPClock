@@ -1254,6 +1254,7 @@ void loop() {
     // check the light to setup matrix intensivity after a final write
     if (IntensityCheck.check(IntensityWait)) {
       uint16_t lux = lightMeter.readLightLevel();
+      const bool screenSaverAllowed = ClockState != _Clock_sky_stars_init && ClockState != _Clock_sky_stars;
       display.intensity = IntensityMap(lux);
       //PRINT("Light: ",lux);
       //PRINT(" lx  MAP:", intensity);
@@ -1268,6 +1269,12 @@ void loop() {
         digitalWrite(sledPin, HIGH);
         matrix.shutdown(true);
         screenSaverNotActive = false;
+      } else if (!screenSaverAllowed) {
+        ScreenSaver.start();
+        digitalWrite(sledPin, LOW);
+        matrix.shutdown(false);
+        screenSaverNotActive = true;
+        lastTimeMove = millis();
       } else {
         // check and activate screen saver mode max7219 -> shutdown mode and (re)set screenSaverNotActive flag for matrix.write
         if (digitalRead(pirPin)) {

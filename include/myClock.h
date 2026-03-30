@@ -94,7 +94,7 @@ typedef float pres_t;
 #define SankeNextRound 10
 #define pinRandom 32
 #define SnakeWait 50
-#define SkyStarsMax 4
+#define SkyStarsMax 8
 #define SkyStarsWaitMin 180
 #define SkyStarsWaitMax 650
 
