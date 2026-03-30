@@ -185,6 +185,8 @@ enum ClockStates
    _Clock_display_off,
    _Clock_Temp_init,
    _Clock_Temp,
+   _Clock_ip_init,
+   _Clock_ip,
    _Clock_remote_message_init,
    _Clock_remote_message,
    _Clock_idle,

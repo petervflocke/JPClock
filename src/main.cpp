@@ -274,6 +274,9 @@ ClockStates normalizeClockStateForReturn(ClockStates state) {
     case _Clock_Temp_init:
     case _Clock_Temp:
       return _Clock_Temp_init;
+    case _Clock_ip_init:
+    case _Clock_ip:
+      return _Clock_ip_init;
     case _Clock_menu_init:
     case _Clock_menu:
       return _Clock_menu_init;
@@ -1457,10 +1460,34 @@ void loop() {
           }
           display.updateDisplay = true;
         }
-        if (keyboard(_Clock_menu_init, _Clock_simple_time_init, _Clock_none, _Clock_none) == SW_UP) {
+        if (keyboard(_Clock_menu_init, _Clock_ip_init, _Clock_none, _Clock_none) == SW_UP) {
           display.dataMode = (display.dataMode + 1) % 3;
           StatTask.check(-DiagramDelay);
         }
+        break;
+
+      case _Clock_ip_init:
+        clearScreen();
+        clockReadyForRemoteMessages = false;
+        if (WiFi.isConnected()) {
+          display.paramS = "IP " + WiFi.localIP().toString();
+        } else {
+          display.paramS = "IP No WiFi";
+        }
+        zoneInfo0.setText(display.paramS, _SCROLL_LEFT, _TO_FULL, InfoQuick, I0s, I0e);
+        zoneInfo0.Animate(true);
+        goBackState = _Clock_ip_init;
+        ClockState = _Clock_ip;
+        break;
+
+      case _Clock_ip:
+        clockReadyForRemoteMessages = true;
+        display.updateDisplay |= zoneInfo0.Animate(false);
+        if (zoneInfo0.AnimateDone()) {
+          zoneInfo0.Reset();
+          display.updateDisplay = true;
+        }
+        key = keyboard(_Clock_Temp_init, _Clock_simple_time_init, _Clock_none, _Clock_none);
         break;
 
       case _Clock_remote_message_init:
@@ -1628,7 +1655,7 @@ void loop() {
           }
         }
 
-        key = keyboard(_Clock_Temp_init, _Clock_complete_info_init, _Clock_none, _Clock_none);
+        key = keyboard(_Clock_ip_init, _Clock_complete_info_init, _Clock_none, _Clock_none);
         break;
 
       case _Clock_menu_init:

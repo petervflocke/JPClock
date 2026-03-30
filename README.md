@@ -10,6 +10,7 @@ The implementation in [src/main.cpp](/home/peter/Development/platformio/JPClock/
 
 - `complete info`: main clock view with animated hours/minutes and a rotating info line
 - `simple time`: full `HH:MM:SS` display plus a snake animation on the right side of the matrix
+- `IP`: scrolling display of the currently assigned Wi-Fi IP address
 - `menu`: `Ding` entry used to toggle the chime function on or off
 - `menu_display`: `LED` entry used to control manual display-off
 - `SkyStars`: decorative black-screen star field with bursty star timing, uneven lifetimes, irregular twinkle, and a rare comet
@@ -91,8 +92,9 @@ If an NTP sync fails, the firmware retries more aggressively by reducing the res
 The rotary encoder/button is used to move between views:
 
 - In `complete info`, clockwise goes to `simple time`, counter-clockwise goes to `LED`, and button release advances the info line immediately.
-- In `simple time`, clockwise goes to `temp` and counter-clockwise goes to `complete info`.
-- In `temp`, clockwise goes to `Ding` and counter-clockwise goes to `simple time`, and button release switches between temperature, pressure, and humidity graphs.
+- In `simple time`, clockwise goes to `IP` and counter-clockwise goes to `complete info`.
+- In `IP`, clockwise goes to `temp` and counter-clockwise goes to `simple time`.
+- In `temp`, clockwise goes to `Ding` and counter-clockwise goes to `IP`, and button release switches between temperature, pressure, and humidity graphs.
 - In `Ding`, clockwise goes to `LED`, counter-clockwise goes to `temp`, and button release toggles hourly/quarter chime on or off.
 - In `LED`, clockwise goes to `SkyStars`, counter-clockwise goes to `Ding`, and button release starts the manual display-off fade.
 - In `SkyStars`, clockwise goes to `complete info` and counter-clockwise goes to `LED`.
@@ -100,7 +102,7 @@ The rotary encoder/button is used to move between views:
 
 The current clockwise loop in code is:
 
-- `complete info -> simple time -> temp -> Ding -> LED -> SkyStars -> complete info`
+- `complete info -> simple time -> IP -> temp -> Ding -> LED -> SkyStars -> complete info`
 
 `SkyStars` uses a black background across the full matrix, keeps at most four stars active at once, varies the delay between new stars, lets some stars disappear quickly while others linger, makes one star twinkle irregularly, and occasionally sends a comet across the display.
 
