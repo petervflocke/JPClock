@@ -64,12 +64,18 @@
 #define numberOfHorizontalDisplays 8
 #define numberOfVerticalDisplays 1
 
-// numberOfHorizontalDisplays*8
+// 56 usable columns remain after reserving 8 pixels for the mode label.
 #define NumberOfPoints 56
 #define ShiftDiagram 8
+/* Sensor history sample cadence in seconds. */
 #define MeasurementFreg 1
-// #define MaxMeasurements SECS_PER_DAY
-#define MaxMeasurements SECS_PER_DAY
+/* One histogram bar covers one hour, so the chart shows the last 56 hours. */
+#define HistoryPointSpanSeconds (60UL * 60UL)
+#define MaxMeasurements (HistoryPointSpanSeconds / MeasurementFreg)
+/* Keep short-term trends visible on the 8-pixel chart. */
+#define HistoryMinTempRange 2.0F
+#define HistoryMinPresRange 4.0F
+#define HistoryMinHumiRange 8.0F
 typedef float temp_t;
 typedef float humi_t;
 typedef float pres_t;
@@ -169,7 +175,9 @@ typedef float pres_t;
 #define CHIMEQ 900
 #define DingON   9
 #define DingOFF 23
-// define freq. to update MQTT/IOT page in seconds
+// define inbound MQTT subscription poll interval in milliseconds
+#define Time2PollMQTT 10000
+// define frequency to update MQTT/IOT page in milliseconds
 #define Time2UpdateMQTT 60000
 
 // Custom 5x7 glyphs stored in PPMax72xxPanel/src/customglcdfont.c

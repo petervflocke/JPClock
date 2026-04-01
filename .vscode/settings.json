@@ -2,7 +2,7 @@
     "github.copilot.enable": {
         "*": false
     },
-
+    "terminal.integrated.gpuAcceleration": "off",
     "files.watcherExclude": {
     "**/.git/**": true,
     "**/.pio/**": true,

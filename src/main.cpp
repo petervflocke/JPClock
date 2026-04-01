@@ -726,6 +726,80 @@ void clearScreen(void) {
   stopVoiceCoilMotion();
 }
 
+void clearDisplayBuffer(void) {
+  matrix.setClip(0, matrix.width(), 0, matrix.height());
+  matrix.fillScreen(LOW);
+}
+
+float updateRunningAverage(float currentAverage, float sample, unsigned long sampleCount) {
+  return currentAverage + (sample - currentAverage) / sampleCount;
+}
+
+void shiftHistoryTablesLeft(void) {
+  for (int ii = 0; ii < NumberOfPoints - 1; ++ii) {
+    tempTable[ii] = tempTable[ii + 1];
+    presTable[ii] = presTable[ii + 1];
+    humiTable[ii] = humiTable[ii + 1];
+  }
+  tempTable[NumberOfPoints - 1] = 0;
+  presTable[NumberOfPoints - 1] = 0;
+  humiTable[NumberOfPoints - 1] = 0;
+}
+
+void ensureHistoryRange(float &minValue, float &maxValue, float minimumRange) {
+  if (maxValue - minValue >= minimumRange) {
+    return;
+  }
+
+  const float center = (minValue + maxValue) * 0.5f;
+  minValue = center - minimumRange * 0.5f;
+  maxValue = center + minimumRange * 0.5f;
+}
+
+void updateHistoryBounds(DisplayState &display, uint8_t historyPointCount) {
+  if (historyPointCount == 0) {
+    display.tempMin = 0;
+    display.tempMax = HistoryMinTempRange;
+    display.presMin = 0;
+    display.presMax = HistoryMinPresRange;
+    display.humiMin = 0;
+    display.humiMax = HistoryMinHumiRange;
+    return;
+  }
+
+  display.tempMin = display.tempMax = tempTable[0];
+  display.presMin = display.presMax = presTable[0];
+  display.humiMin = display.humiMax = humiTable[0];
+
+  for (uint8_t ii = 1; ii < historyPointCount; ++ii) {
+    const temp_t tempValue = tempTable[ii];
+    if (tempValue < display.tempMin) display.tempMin = tempValue;
+    if (tempValue > display.tempMax) display.tempMax = tempValue;
+
+    const pres_t presValue = presTable[ii];
+    if (presValue < display.presMin) display.presMin = presValue;
+    if (presValue > display.presMax) display.presMax = presValue;
+
+    const humi_t humiValue = humiTable[ii];
+    if (humiValue < display.humiMin) display.humiMin = humiValue;
+    if (humiValue > display.humiMax) display.humiMax = humiValue;
+  }
+
+  ensureHistoryRange(display.tempMin, display.tempMax, HistoryMinTempRange);
+  ensureHistoryRange(display.presMin, display.presMax, HistoryMinPresRange);
+  ensureHistoryRange(display.humiMin, display.humiMax, HistoryMinHumiRange);
+}
+
+int scaleHistoryValue(float value, float minValue, float maxValue) {
+  const float range = maxValue - minValue;
+  if (range <= 0.0f) {
+    return 1;
+  }
+
+  const float scaled = 1.0f + ((value - minValue) * 7.0f / range);
+  return constrain((int)(scaled + 0.5f), 1, 8);
+}
+
 void showOtaStartMessage(void) {
   matrix.shutdown(false);
   matrix.setClip(0, matrix.width(), 0, matrix.height());
@@ -1335,9 +1409,10 @@ void loop() {
     DisplayState &display = displayState;
     uint8_t key;
 
-    // index for tables with measurements
-    static uint8_t dayNumber = 0;
-    static unsigned long measurementNumber = 1;
+    // History is stored in hourly slots across the 56 graph columns.
+    static uint8_t historyIndex = 0;
+    static uint8_t historyPointCount = 0;
+    static unsigned long historySampleCount = 0;
 
     temp_t tempValue;
     pres_t presValue;
@@ -1374,35 +1449,37 @@ void loop() {
       _l = lightMeter.readLightLevel();
       xSemaphoreGive(bufMutex);
 
-      display.averageTemp = tempTable[dayNumber] + (_t - tempTable[dayNumber]) / measurementNumber;
-      tempTable[dayNumber] = display.averageTemp;
+      historySampleCount++;
+      if (historyPointCount == 0 || historyIndex >= historyPointCount) {
+        historyPointCount = historyIndex + 1;
+      }
 
-      display.averagePres = presTable[dayNumber] + (_p - presTable[dayNumber]) / measurementNumber;
-      presTable[dayNumber] = display.averagePres;
+      display.averageTemp = updateRunningAverage(tempTable[historyIndex], _t, historySampleCount);
+      tempTable[historyIndex] = display.averageTemp;
 
-      display.averageHumi = humiTable[dayNumber] + (_h - humiTable[dayNumber]) / measurementNumber;
-      humiTable[dayNumber] = display.averageHumi;
+      display.averagePres = updateRunningAverage(presTable[historyIndex], _p, historySampleCount);
+      presTable[historyIndex] = display.averagePres;
+
+      display.averageHumi = updateRunningAverage(humiTable[historyIndex], _h, historySampleCount);
+      humiTable[historyIndex] = display.averageHumi;
 
 
-      //    PRINT("Day: ", dayNumber);
-      //    PRINT("   Measuremeant: ", measurementNumber);
-      //    PRINT("  Aver humi: ", humiTable[dayNumber]);
+      //    PRINT("Slot: ", historyIndex);
+      //    PRINT("   Samples: ", historySampleCount);
+      //    PRINT("  Aver humi: ", humiTable[historyIndex]);
       //    PRINTLN;
 
-      measurementNumber++;
-      if (measurementNumber >= MaxMeasurements) {
-        measurementNumber = 1;
-        dayNumber++;
-        if (ClockState == _Clock_Temp) ClockState = _Clock_Temp_init;
-        if (dayNumber >= NumberOfPoints) {
-          for (int ii = 0; ii <= NumberOfPoints - 2; ii++) {
-            tempTable[ii] = tempTable[ii + 1];
-            presTable[ii] = presTable[ii + 1];
-            humiTable[ii] = humiTable[ii + 1];
-          }
-          tempTable[NumberOfPoints - 1] = 0;
-          dayNumber = NumberOfPoints - 1;
+      if (historySampleCount >= MaxMeasurements) {
+        historySampleCount = 0;
+        historyIndex++;
+        if (historyIndex >= NumberOfPoints) {
+          shiftHistoryTablesLeft();
+          historyIndex = NumberOfPoints - 1;
+          historyPointCount = NumberOfPoints - 1;
         }
+        tempTable[historyIndex] = 0;
+        presTable[historyIndex] = 0;
+        humiTable[historyIndex] = 0;
       }
     }
 
@@ -1554,36 +1631,7 @@ void loop() {
       case _Clock_Temp_init:
         clearScreen();
         clockReadyForRemoteMessages = false;
-        StatTask.start();
-        display.tempMin = tempTable[0];
-        display.tempMax = tempTable[0];
-        display.presMin = presTable[0];
-        display.presMax = presTable[0];
-        display.humiMin = humiTable[0];
-        display.humiMax = humiTable[0];
-        for (ptr = 0; ptr < dayNumber; ptr++) {
-          tempValue = tempTable[ptr];
-
-          //            PRINT("tempValue : ", tempValue);
-          //            PRINT("  min : ", tempMin);
-          //            PRINT("  max : ", tempMax);
-          //            PRINTLN;
-
-          if (tempValue < display.tempMin) display.tempMin = tempValue;
-          if (tempValue > display.tempMax) display.tempMax = tempValue;
-
-          presValue = presTable[ptr];
-          if (presValue < display.presMin) display.presMin = presValue;
-          if (presValue > display.presMax) display.presMax = presValue;
-
-          humiValue = humiTable[ptr];
-          if (humiValue < display.humiMin) display.humiMin = humiValue;
-          if (humiValue > display.humiMax) display.humiMax = humiValue;
-        }
-        if (display.tempMax - display.tempMin < 8) display.tempMax = display.tempMin + 8;
-        if (display.presMax - display.presMin < 8) display.presMax = display.presMin + 8;
-        if (display.humiMax - display.humiMin < 8) display.humiMax = display.humiMin + 8;
-
+        StatTask.start(-DiagramDelay);
         goBackState = _Clock_Temp_init;
         ClockState = _Clock_Temp;
         display.dataMode = 0;
@@ -1593,7 +1641,8 @@ void loop() {
         clockReadyForRemoteMessages = true;
 
         if (StatTask.check(DiagramDelay)) {
-          clearScreen();
+          clearDisplayBuffer();
+          updateHistoryBounds(display, historyPointCount);
           matrix.setCursor(0, 0);
           switch (display.dataMode) {
             case 0:
@@ -1606,19 +1655,18 @@ void loop() {
               matrix.print("H");
               break;
           }
-          for (ptr = 0; ptr <= dayNumber; ptr++) {
+          for (ptr = 0; ptr < historyPointCount; ptr++) {
             switch (display.dataMode) {
               case 0:
-                intValue = map(tempTable[ptr], display.tempMin, display.tempMax, 0, 8);
+                intValue = scaleHistoryValue(tempTable[ptr], display.tempMin, display.tempMax);
                 break;
               case 1:
-                intValue = map(presTable[ptr], display.presMin, display.presMax, 0, 8);
+                intValue = scaleHistoryValue(presTable[ptr], display.presMin, display.presMax);
                 break;
               case 2:
-                intValue = map(humiTable[ptr], display.humiMin, display.humiMax, 0, 8);
+                intValue = scaleHistoryValue(humiTable[ptr], display.humiMin, display.humiMax);
                 break;
             }
-            intValue = constrain(intValue, 0, 8);
 
             //              PRINT("i: ", ptr);
             //              PRINT("  Table: ", intValue);
@@ -2145,7 +2193,7 @@ void processEncoder() {
 
 
 void taskMQTT(void *parameter) {
-  const TickType_t xTicksToWait = pdMS_TO_TICKS(250);
+  const TickType_t xTicksToWait = pdMS_TO_TICKS(Time2PollMQTT);
   float _tt, _hh, _pp, _ll;
   unsigned long lastPublishAt = 0;
 
