@@ -105,6 +105,7 @@ Schedular UpdateMQTT(_Seconds);      // Frequency of updating IOT
 Schedular RemoteMessageRepeat(_Millis);
 Schedular RemoteMessageMotion(_Millis);
 Schedular DisplayOffFade(_Millis);
+Schedular WakeGreetingDisplay(_Millis);
 
 // MP3 Player
 HardwareSerial DFPSerial(1);
@@ -134,6 +135,7 @@ Adafruit_MQTT_Subscribe msgMQTTSub = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME
 // for some reason (only affects ESP8266, likely an arduino-builder bug).
 boolean MQTT_connect();
 void clearScreen(void);
+void showOtaStartMessage(void);
 boolean SyncNTP();
 boolean StartSyncNTP();
 void SetupWiFi(void);
@@ -162,6 +164,17 @@ void applyDstTestTime();
 time_t buildUtcTime(uint16_t yearValue, uint8_t monthValue, uint8_t dayValue, uint8_t hourValue, uint8_t minuteValue, uint8_t secondValue);
 uint8_t lastSundayOfMonth(uint16_t yearValue, uint8_t monthValue);
 ClockStates normalizeClockStateForReturn(ClockStates state);
+uint32_t buildLocalDateKey(time_t localTime);
+void resetWakeGreetingFlagsIfNeeded(time_t localTime);
+bool isWakeGreetingEligibleState(ClockStates state);
+bool prepareWakeGreeting(time_t localTime, unsigned long inactivityMs);
+#if EnableSoundTestMode
+void resetSoundTestSelection();
+void advanceSoundTestSelection();
+void updateSoundTestDisplayText(DisplayState &display);
+void playCurrentSoundTestSelection();
+void stopSoundTestPlayback();
+#endif
 void queueRemoteMessage(const char *message);
 bool hasPendingRemoteMessage();
 bool takePendingRemoteMessage();
@@ -197,6 +210,33 @@ bool remoteMessageWaitingForRepeat = false;
 bool remoteMessageMotionActive = false;
 bool clockReadyForRemoteMessages = false;
 ClockStates remoteMessageReturnState = _Clock_complete_info_init;
+bool morningGreetingShownToday = false;
+bool afternoonGreetingShownToday = false;
+uint32_t wakeGreetingDayKey = 0;
+char wakeGreetingMessage[32] = "";
+uint8_t wakeGreetingSoundFolder = 0;
+uint16_t wakeGreetingSoundFile = 0;
+
+#if EnableSoundTestMode
+struct SoundTestCatalogEntry {
+  uint8_t folder;
+  uint16_t firstTrack;
+  uint16_t lastTrack;
+  bool useLargeFolder;
+};
+
+static const SoundTestCatalogEntry soundTestCatalog[] = {
+  {1, 0, 11, false},
+  {2, 0, 3, false},
+  {3, 101, 102, false},
+  {4, 0, 3, false},
+  {5, 0, 1, false},
+};
+
+static const size_t soundTestCatalogCount = sizeof(soundTestCatalog) / sizeof(soundTestCatalog[0]);
+uint8_t soundTestCatalogIndex = 0;
+uint16_t soundTestTrack = 0;
+#endif
 
 
 // Parameter section, just one for the time being
@@ -277,6 +317,14 @@ ClockStates normalizeClockStateForReturn(ClockStates state) {
     case _Clock_ip_init:
     case _Clock_ip:
       return _Clock_ip_init;
+    case _Clock_wake_greeting_init:
+    case _Clock_wake_greeting:
+      return _Clock_complete_info_init;
+#if EnableSoundTestMode
+    case _Clock_sound_test_init:
+    case _Clock_sound_test:
+      return _Clock_sound_test_init;
+#endif
     case _Clock_menu_init:
     case _Clock_menu:
       return _Clock_menu_init;
@@ -297,10 +345,99 @@ ClockStates normalizeClockStateForReturn(ClockStates state) {
   }
 }
 
+uint32_t buildLocalDateKey(time_t localTime) {
+  return (uint32_t)year(localTime) * 10000UL + (uint32_t)month(localTime) * 100UL + (uint32_t)day(localTime);
+}
+
+void resetWakeGreetingFlagsIfNeeded(time_t localTime) {
+  const uint32_t localDayKey = buildLocalDateKey(localTime);
+  if (wakeGreetingDayKey != localDayKey) {
+    wakeGreetingDayKey = localDayKey;
+    morningGreetingShownToday = false;
+    afternoonGreetingShownToday = false;
+  }
+}
+
+bool isWakeGreetingEligibleState(ClockStates state) {
+  return state == _Clock_complete_info || state == _Clock_complete_info_init;
+}
+
+bool prepareWakeGreeting(time_t localTime, unsigned long inactivityMs) {
+  if (!isWakeGreetingEligibleState(ClockState)) return false;
+
+  if (hour(localTime) >= WakeGreetingMorningStartHour && hour(localTime) < WakeGreetingMorningEndHour) {
+    if (!morningGreetingShownToday && inactivityMs >= WakeGreetingMorningIdleSeconds * 1000UL) {
+      randomSeed(analogRead(pinRandom) + micros());
+      strncpy(wakeGreetingMessage, "Good Morning", sizeof(wakeGreetingMessage) - 1);
+      wakeGreetingMessage[sizeof(wakeGreetingMessage) - 1] = '\0';
+      wakeGreetingSoundFolder = WakeGreetingMorningSoundFolder;
+      wakeGreetingSoundFile = random(WakeGreetingMorningSoundFirst, WakeGreetingMorningSoundLast + 1);
+      morningGreetingShownToday = true;
+      return true;
+    }
+  }
+
+  if (hour(localTime) >= WakeGreetingAfternoonStartHour && hour(localTime) < WakeGreetingAfternoonEndHour) {
+    if (!afternoonGreetingShownToday && inactivityMs >= WakeGreetingAfternoonIdleSeconds * 1000UL) {
+      randomSeed(analogRead(pinRandom) + micros());
+      strncpy(wakeGreetingMessage, "Great to see you again", sizeof(wakeGreetingMessage) - 1);
+      wakeGreetingMessage[sizeof(wakeGreetingMessage) - 1] = '\0';
+      wakeGreetingSoundFolder = WakeGreetingAfternoonSoundFolder;
+      wakeGreetingSoundFile = random(WakeGreetingAfternoonSoundFirst, WakeGreetingAfternoonSoundLast + 1);
+      afternoonGreetingShownToday = true;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+#if EnableSoundTestMode
+void resetSoundTestSelection() {
+  soundTestCatalogIndex = 0;
+  soundTestTrack = soundTestCatalog[0].firstTrack;
+}
+
+void advanceSoundTestSelection() {
+  const SoundTestCatalogEntry &entry = soundTestCatalog[soundTestCatalogIndex];
+  if (soundTestTrack < entry.lastTrack) {
+    soundTestTrack++;
+    return;
+  }
+
+  soundTestCatalogIndex = (soundTestCatalogIndex + 1) % soundTestCatalogCount;
+  soundTestTrack = soundTestCatalog[soundTestCatalogIndex].firstTrack;
+}
+
+void updateSoundTestDisplayText(DisplayState &display) {
+  char label[16];
+  snprintf(label, sizeof(label), "Play %u:%03u", soundTestCatalog[soundTestCatalogIndex].folder, (unsigned int)soundTestTrack);
+  display.paramS = label;
+}
+
+void playCurrentSoundTestSelection() {
+  const SoundTestCatalogEntry &entry = soundTestCatalog[soundTestCatalogIndex];
+  if (entry.useLargeFolder) {
+    DFPlayer.playLargeFolder(entry.folder, soundTestTrack);
+  } else {
+    DFPlayer.playFolder(entry.folder, (uint8_t)soundTestTrack);
+  }
+}
+
+void stopSoundTestPlayback() {
+  DFPlayer.stop();
+}
+#endif
+
 void wakeDisplayToMenu(DisplayState &display) {
   displayEnabled = true;
   matrix.shutdown(false);
-  display.intensity = IntensityMap(lightMeter.readLightLevel());
+  const uint16_t lux = lightMeter.readLightLevel();
+  display.intensity = IntensityMap(lux);
+  PRINT_BRIGHTNESS("[Brightness] wake lux=");
+  PRINT_BRIGHTNESS_VALUE("", lux);
+  PRINT_BRIGHTNESS_VALUE(" mapped=", display.intensity);
+  PRINT_BRIGHTNESS_LN();
   display.lintensity = display.intensity;
   matrix.setIntensity(display.intensity);
   screenSaverNotActive = true;
@@ -589,6 +726,15 @@ void clearScreen(void) {
   stopVoiceCoilMotion();
 }
 
+void showOtaStartMessage(void) {
+  matrix.shutdown(false);
+  matrix.setClip(0, matrix.width(), 0, matrix.height());
+  matrix.fillScreen(LOW);
+  matrix.setCursor(0, 0);
+  matrix.print("OTA...");
+  matrix.write();
+}
+
 boolean SyncNTP() {
 
   PRINTS("Contacting NTP Server process\n");
@@ -781,6 +927,14 @@ uint8_t IntensityMap(uint16_t sensor) {
   return Intensity;
 }
 
+static void logBrightnessReading(const char *context, uint16_t lux, uint8_t intensity) {
+  PRINT_BRIGHTNESS("[Brightness] ");
+  PRINT_BRIGHTNESS(context);
+  PRINT_BRIGHTNESS_VALUE(" lux=", lux);
+  PRINT_BRIGHTNESS_VALUE(" mapped=", intensity);
+  PRINT_BRIGHTNESS_LN();
+}
+
 uint8_t keyboard(ClockStates key_DIR_CW, ClockStates key_DIR_CCW, ClockStates key_SW_DOWN, ClockStates key_SW_UP) {
   uint8_t key = DIR_NONE;
 
@@ -950,6 +1104,7 @@ void setup() {
   Wire.begin(21, 22, 400000);
   //  ADDR=0 => 0x23 and ADDR=1 => 0x5C.
   lightMeter.begin();
+  randomSeed(analogRead(pinRandom) + micros());
 
 
   pinMode(sledPin, OUTPUT);        // passing seconds LED
@@ -958,7 +1113,10 @@ void setup() {
   pinMode(pirPin, INPUT);          // input from PIR sensor
 
   // matrix.setIntensity(0); // Use a value between 0 and 15 for brightness
-  matrix.setIntensity(IntensityMap(lightMeter.readLightLevel()));
+  const uint16_t startupLux = lightMeter.readLightLevel();
+  const uint8_t startupIntensity = IntensityMap(startupLux);
+  logBrightnessReading("startup", startupLux, startupIntensity);
+  matrix.setIntensity(startupIntensity);
 
   matrix.setPosition(0, 7, 0);
   matrix.setRotation(0, 3);
@@ -1123,6 +1281,7 @@ void setup() {
         else  // U_SPIFFS
           type = "filesystem";
 
+        showOtaStartMessage();
         // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
         Serial.println("Start updating " + type);
       })
@@ -1163,6 +1322,7 @@ void setup() {
 void loop() {
   time_t LocalTime;
   static unsigned long lastTimeMove;
+  static bool pirWasHigh = false;
   unsigned long voiceCoilDeta;
 
   ArduinoOTA.handle();
@@ -1201,6 +1361,9 @@ void loop() {
     boolean continueLoop = true;
 
     static byte VAValue;
+
+    LocalTime = CET.toLocal(now());
+    resetWakeGreetingFlagsIfNeeded(LocalTime);
 
     if (SensorUpdate.check(MeasurementFreg)) {
 
@@ -1258,10 +1421,12 @@ void loop() {
     if (IntensityCheck.check(IntensityWait)) {
       uint16_t lux = lightMeter.readLightLevel();
       const bool screenSaverAllowed = ClockState != _Clock_sky_stars_init && ClockState != _Clock_sky_stars;
+      const bool pirHigh = digitalRead(pirPin);
+      const bool pirRisingEdge = pirHigh && !pirWasHigh;
+      const bool screenSaverWasActive = !screenSaverNotActive;
+      const unsigned long inactivityMs = millis() - lastTimeMove;
       display.intensity = IntensityMap(lux);
-      //PRINT("Light: ",lux);
-      //PRINT(" lx  MAP:", intensity);
-      //PRINTLN;
+      logBrightnessReading("periodic", lux, display.intensity);
       if (display.intensity != display.lintensity) {
         //matrix.setIntensity(intensity);
         display.lintensity = display.intensity;
@@ -1280,13 +1445,17 @@ void loop() {
         lastTimeMove = millis();
       } else {
         // check and activate screen saver mode max7219 -> shutdown mode and (re)set screenSaverNotActive flag for matrix.write
-        if (digitalRead(pirPin)) {
+        if (pirHigh) {
           ScreenSaver.start();
           digitalWrite(sledPin, LOW);
           matrix.shutdown(false);
           screenSaverNotActive = true;
           lastTime = digitalClockString();
           lastTimeMove = millis();
+          if (screenSaverWasActive && pirRisingEdge && prepareWakeGreeting(LocalTime, inactivityMs)) {
+            goBackState = _Clock_complete_info_init;
+            ClockState = _Clock_wake_greeting_init;
+          }
           // dacWrite(DACVoiceCoil, voiceCoilMax);
         } else {
           if (ScreenSaver.check(ScreenTimeOut)) {
@@ -1308,6 +1477,7 @@ void loop() {
           }
         }
       }
+      pirWasHigh = pirHigh;
     }
 
     // check if the last NTP sync was successful, if not reduce the resync time to 60s
@@ -1489,6 +1659,66 @@ void loop() {
         }
         key = keyboard(_Clock_Temp_init, _Clock_simple_time_init, _Clock_none, _Clock_none);
         break;
+
+      case _Clock_wake_greeting_init:
+        clearScreen();
+        clockReadyForRemoteMessages = false;
+        if (wakeGreetingMessage[0] == '\0') {
+          ClockState = _Clock_complete_info_init;
+          break;
+        }
+        zoneInfo0.setText(wakeGreetingMessage, _SCROLL_LEFT, _TO_FULL, InfoQuick, I0s, I0e);
+        display.updateDisplay = zoneInfo0.Animate(false);
+        WakeGreetingDisplay.start();
+        if (wakeGreetingSoundFolder > 0) {
+          DFPlayer.playFolder(wakeGreetingSoundFolder, (uint8_t)wakeGreetingSoundFile);
+        }
+        goBackState = _Clock_complete_info_init;
+        ClockState = _Clock_wake_greeting;
+        break;
+
+      case _Clock_wake_greeting:
+        clockReadyForRemoteMessages = false;
+        {
+          const bool greetingExpired = WakeGreetingDisplay.check(WakeGreetingDurationMs);
+          display.updateDisplay |= zoneInfo0.Animate(false);
+          if (!greetingExpired && zoneInfo0.AnimateDone()) {
+            zoneInfo0.Reset();
+            display.updateDisplay = true;
+          }
+          if (greetingExpired) {
+            ClockState = _Clock_complete_info_init;
+          }
+        }
+        break;
+
+#if EnableSoundTestMode
+      case _Clock_sound_test_init:
+        clearScreen();
+        clockReadyForRemoteMessages = false;
+        resetSoundTestSelection();
+        updateSoundTestDisplayText(display);
+        zoneInfo0.setText(display.paramS, _PRINT, _NONE_MOD, InfoTick, I0s, I0e);
+        display.updateDisplay = zoneInfo0.Animate(false);
+        goBackState = _Clock_sound_test_init;
+        ClockState = _Clock_sound_test;
+        break;
+
+      case _Clock_sound_test:
+        clockReadyForRemoteMessages = true;
+        key = keyboard(_Clock_complete_info_init, _Clock_sky_stars_init, _Clock_none, _Clock_none);
+        if (key == SW_DOWN) {
+          playCurrentSoundTestSelection();
+        } else if (key == SW_UP) {
+          advanceSoundTestSelection();
+          updateSoundTestDisplayText(display);
+          zoneInfo0.setText(display.paramS, _PRINT, _NONE_MOD, InfoTick, I0s, I0e);
+          display.updateDisplay = zoneInfo0.Animate(false);
+        } else if (key == DIR_CW || key == DIR_CCW) {
+          stopSoundTestPlayback();
+        }
+        break;
+#endif
 
       case _Clock_remote_message_init:
         clearScreen();
@@ -1721,7 +1951,11 @@ void loop() {
       case _Clock_sky_stars:
         clockReadyForRemoteMessages = true;
         display.updateDisplay |= skyStarsMode.update(matrix);
+#if EnableSoundTestMode
+        key = keyboard(_Clock_sound_test_init, _Clock_menu_display_init, _Clock_none, _Clock_none);
+#else
         key = keyboard(_Clock_complete_info_init, _Clock_menu_display_init, _Clock_none, _Clock_none);
+#endif
         break;
 
       case _Clock_display_off_init:
@@ -1838,7 +2072,11 @@ void loop() {
           display.dataMode = (display.dataMode + 1) % 5;
         }
         display.updateDisplay |= zoneInfo1.Animate(false);
+#if EnableSoundTestMode
+        if (keyboard(_Clock_simple_time_init, _Clock_sound_test_init, _Clock_none, _Clock_none) == SW_UP) {
+#else
         if (keyboard(_Clock_simple_time_init, _Clock_sky_stars_init, _Clock_none, _Clock_none) == SW_UP) {
+#endif
           display.dataMode = (display.dataMode + 1) % 5;
           DataDisplayTask.start(-FullInfoDelay);
         }
@@ -1848,12 +2086,16 @@ void loop() {
         //          break;
 
       default:;
+
     }
 
     if (clockReadyForRemoteMessages && hasPendingRemoteMessage()) {
       remoteMessageReturnState = normalizeClockStateForReturn(ClockState);
       PRINT("Remote Msg takeover from state ", remoteMessageReturnState);
       PRINTLN;
+#if EnableSoundTestMode
+      if (ClockState == _Clock_sound_test) stopSoundTestPlayback();
+#endif
       ClockState = _Clock_remote_message_init;
     }
 

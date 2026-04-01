@@ -1,5 +1,25 @@
 {
     "github.copilot.enable": {
         "*": false
-    }
+    },
+
+    "files.watcherExclude": {
+    "**/.git/**": true,
+    "**/.pio/**": true,
+    "**/.pio/build/**": true,
+    "**/.pio/libdeps/**": true,
+    "**/.venv/**": true,
+    "**/venv/**": true,
+    "**/__pycache__/**": true
+  },
+
+  "search.exclude": {
+    "**/.pio/**": true,
+    "**/.pio/build/**": true,
+    "**/.pio/libdeps/**": true,
+    "**/.venv/**": true,
+    "**/venv/**": true,
+    "**/__pycache__/**": true
+  }
+
 }

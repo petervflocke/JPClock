@@ -3,6 +3,7 @@
 // Turn on debug statements to the serial output
 
 #define  DEBUG_ON 0
+#define  DEBUG_BRIGHTNESS 0
 
 #if  DEBUG_ON
 #define PRINT(s, v) { Serial.print(s); Serial.print(v); }    
@@ -15,6 +16,16 @@
 #define PRINTS(s)     
 #define PRINTLN
 #define PRINTT 
+#endif
+
+#if DEBUG_BRIGHTNESS
+#define PRINT_BRIGHTNESS(s) Serial.print(s)
+#define PRINT_BRIGHTNESS_VALUE(s, v) { Serial.print(s); Serial.print(v); }
+#define PRINT_BRIGHTNESS_LN() Serial.println()
+#else
+#define PRINT_BRIGHTNESS(s)
+#define PRINT_BRIGHTNESS_VALUE(s, v)
+#define PRINT_BRIGHTNESS_LN()
 #endif
 
 // For system Pulse Indicator
@@ -112,6 +123,26 @@ typedef float pres_t;
 #define FullInfoDelay 2000
 /* Refresh period for diagram/statistic mode. */
 #define DiagramDelay 200
+/* Full-width wake greeting display time after a long idle wake-up. */
+#define WakeGreetingDurationMs 3500
+/* Require a long, real absence before the greeting may trigger. */
+#define WakeGreetingMorningIdleSeconds (3 * 60 * 60)
+#define WakeGreetingAfternoonIdleSeconds (3 * 60 * 60)
+/* Morning wake-up window: 06:00 <= t < 11:00. */
+#define WakeGreetingMorningStartHour 6
+#define WakeGreetingMorningEndHour 11
+/* Afternoon welcome window: 12:00 <= t < 19:00. */
+#define WakeGreetingAfternoonStartHour 12
+#define WakeGreetingAfternoonEndHour 19
+/* DFPlayer folder tracks for wake greetings. */
+#define WakeGreetingMorningSoundFolder 4
+#define WakeGreetingMorningSoundFirst 0
+#define WakeGreetingMorningSoundLast 3
+#define WakeGreetingAfternoonSoundFolder 5
+#define WakeGreetingAfternoonSoundFirst 0
+#define WakeGreetingAfternoonSoundLast 1
+/* Optional manual sound-test mode in the main mode ring. */
+#define EnableSoundTestMode 0
 /* Pause before a remote message starts scrolling again. */
 #define RemoteMessageRepeatDelay 2500
 /* How long the HDD arm may move for one remote message. */
@@ -187,6 +218,12 @@ enum ClockStates
    _Clock_Temp,
    _Clock_ip_init,
    _Clock_ip,
+   _Clock_wake_greeting_init,
+   _Clock_wake_greeting,
+#if EnableSoundTestMode
+   _Clock_sound_test_init,
+   _Clock_sound_test,
+#endif
    _Clock_remote_message_init,
    _Clock_remote_message,
    _Clock_idle,
