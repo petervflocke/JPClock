@@ -2,8 +2,13 @@
 
 // Turn on debug statements to the serial output
 
+#ifndef DEBUG_ON
 #define  DEBUG_ON 0
+#endif
+
+#ifndef DEBUG_BRIGHTNESS
 #define  DEBUG_BRIGHTNESS 0
+#endif
 
 #if  DEBUG_ON
 #define PRINT(s, v) { Serial.print(s); Serial.print(v); }    
@@ -56,7 +61,9 @@
 
 #define pirPin     14
 #define DarkLevel  50
+#ifndef ScreenTimeOut
 #define ScreenTimeOut 300
+#endif
 
 // PPMax72xxPanel definitions
 // Attach CS to this pin, DIN to MOSI and CLK to SCK (cf http://arduino.cc/en/Reference/SPI )
@@ -130,16 +137,26 @@ typedef float pres_t;
 /* Refresh period for diagram/statistic mode. */
 #define DiagramDelay 200
 /* Full-width wake greeting display time after a long idle wake-up. */
+#ifndef WakeGreetingDurationMs
 #define WakeGreetingDurationMs 3500
+#endif
 /* Require a long, real absence before the greeting may trigger. */
+#ifndef WakeGreetingMorningIdleSeconds
 #define WakeGreetingMorningIdleSeconds (3 * 60 * 60)
+#endif
+#ifndef WakeGreetingAfternoonIdleSeconds
 #define WakeGreetingAfternoonIdleSeconds (3 * 60 * 60)
+#endif
 /* Morning wake-up window: 06:00 <= t < 11:00. */
 #define WakeGreetingMorningStartHour 6
 #define WakeGreetingMorningEndHour 11
 /* Afternoon welcome window: 12:00 <= t < 19:00. */
 #define WakeGreetingAfternoonStartHour 12
 #define WakeGreetingAfternoonEndHour 19
+/* Test helper for greeting checks: 0 = off, 1 = mock morning, 2 = mock afternoon. */
+#ifndef WakeGreetingTestMode
+#define WakeGreetingTestMode 0
+#endif
 /* DFPlayer folder tracks for wake greetings. */
 #define WakeGreetingMorningSoundFolder 4
 #define WakeGreetingMorningSoundFirst 0
@@ -148,7 +165,9 @@ typedef float pres_t;
 #define WakeGreetingAfternoonSoundFirst 0
 #define WakeGreetingAfternoonSoundLast 1
 /* Optional manual sound-test mode in the main mode ring. */
+#ifndef EnableSoundTestMode
 #define EnableSoundTestMode 0
+#endif
 /* Pause before a remote message starts scrolling again. */
 #define RemoteMessageRepeatDelay 2500
 /* How long the HDD arm may move for one remote message. */

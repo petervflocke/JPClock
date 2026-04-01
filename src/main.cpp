@@ -166,7 +166,8 @@ uint8_t lastSundayOfMonth(uint16_t yearValue, uint8_t monthValue);
 ClockStates normalizeClockStateForReturn(ClockStates state);
 uint32_t buildLocalDateKey(time_t localTime);
 void resetWakeGreetingFlagsIfNeeded(time_t localTime);
-bool isWakeGreetingEligibleState(ClockStates state);
+time_t getWakeGreetingLocalTime(time_t actualLocalTime);
+void printWakeGreetingTestConfiguration(time_t actualLocalTime);
 bool prepareWakeGreeting(time_t localTime, unsigned long inactivityMs);
 #if EnableSoundTestMode
 void resetSoundTestSelection();
@@ -358,12 +359,38 @@ void resetWakeGreetingFlagsIfNeeded(time_t localTime) {
   }
 }
 
-bool isWakeGreetingEligibleState(ClockStates state) {
-  return state == _Clock_complete_info || state == _Clock_complete_info_init;
+time_t getWakeGreetingLocalTime(time_t actualLocalTime) {
+#if WakeGreetingTestMode == 1 || WakeGreetingTestMode == 2
+  tmElements_t tm;
+  breakTime(actualLocalTime, tm);
+  tm.Hour = WakeGreetingTestMode == 1 ? WakeGreetingMorningStartHour : WakeGreetingAfternoonStartHour;
+  tm.Minute = 30;
+  tm.Second = 0;
+  return makeTime(tm);
+#else
+  return actualLocalTime;
+#endif
+}
+
+void printWakeGreetingTestConfiguration(time_t actualLocalTime) {
+#if WakeGreetingTestMode == 1 || WakeGreetingTestMode == 2
+  const time_t mockLocalTime = getWakeGreetingLocalTime(actualLocalTime);
+  PRINTS("Wake greeting test mode active: ");
+  PRINTS(WakeGreetingTestMode == 1 ? "morning" : "afternoon");
+  PRINTS(" screenSaver=");
+  PRINTS(ScreenTimeOut);
+  PRINTS("s idle=");
+  PRINTS(WakeGreetingTestMode == 1 ? WakeGreetingMorningIdleSeconds : WakeGreetingAfternoonIdleSeconds);
+  PRINTS("s local=");
+  PRINTS(formatTimeStamp(mockLocalTime));
+  PRINTLN;
+#else
+  (void)actualLocalTime;
+#endif
 }
 
 bool prepareWakeGreeting(time_t localTime, unsigned long inactivityMs) {
-  if (!isWakeGreetingEligibleState(ClockState)) return false;
+  if (ClockState != _Clock_complete_info && ClockState != _Clock_complete_info_init) return false;
 
   if (hour(localTime) >= WakeGreetingMorningStartHour && hour(localTime) < WakeGreetingMorningEndHour) {
     if (!morningGreetingShownToday && inactivityMs >= WakeGreetingMorningIdleSeconds * 1000UL) {
@@ -373,8 +400,11 @@ bool prepareWakeGreeting(time_t localTime, unsigned long inactivityMs) {
       wakeGreetingSoundFolder = WakeGreetingMorningSoundFolder;
       wakeGreetingSoundFile = random(WakeGreetingMorningSoundFirst, WakeGreetingMorningSoundLast + 1);
       morningGreetingShownToday = true;
+      PRINT("Wake greeting prepared: morning track ", wakeGreetingSoundFile);
+      PRINTLN;
       return true;
     }
+    if (morningGreetingShownToday) PRINTS("Wake greeting skipped: morning already shown today\n");
   }
 
   if (hour(localTime) >= WakeGreetingAfternoonStartHour && hour(localTime) < WakeGreetingAfternoonEndHour) {
@@ -385,8 +415,11 @@ bool prepareWakeGreeting(time_t localTime, unsigned long inactivityMs) {
       wakeGreetingSoundFolder = WakeGreetingAfternoonSoundFolder;
       wakeGreetingSoundFile = random(WakeGreetingAfternoonSoundFirst, WakeGreetingAfternoonSoundLast + 1);
       afternoonGreetingShownToday = true;
+      PRINT("Wake greeting prepared: afternoon track ", wakeGreetingSoundFile);
+      PRINTLN;
       return true;
     }
+    if (afternoonGreetingShownToday) PRINTS("Wake greeting skipped: afternoon already shown today\n");
   }
 
   return false;
@@ -1309,6 +1342,7 @@ void setup() {
       rememberTimezoneState();
       applyDstTestTime();
       printClockTimes("Startup sync");
+      printWakeGreetingTestConfiguration(CET.toLocal(now()));
       zoneInfo0.setText("Sync OK", _SCROLL_LEFT, _TO_LEFT, InfoTick1, I0s, I0e);
       zoneInfo0.Animate(true);
       delay(250);
@@ -1438,7 +1472,8 @@ void loop() {
     static byte VAValue;
 
     LocalTime = CET.toLocal(now());
-    resetWakeGreetingFlagsIfNeeded(LocalTime);
+    const time_t wakeGreetingLocalTime = getWakeGreetingLocalTime(LocalTime);
+    resetWakeGreetingFlagsIfNeeded(wakeGreetingLocalTime);
 
     if (SensorUpdate.check(MeasurementFreg)) {
 
@@ -1529,7 +1564,7 @@ void loop() {
           screenSaverNotActive = true;
           lastTime = digitalClockString();
           lastTimeMove = millis();
-          if (screenSaverWasActive && pirRisingEdge && prepareWakeGreeting(LocalTime, inactivityMs)) {
+          if (screenSaverWasActive && pirRisingEdge && prepareWakeGreeting(wakeGreetingLocalTime, inactivityMs)) {
             goBackState = _Clock_complete_info_init;
             ClockState = _Clock_wake_greeting_init;
           }
