@@ -1,8 +1,3 @@
-/*
- *  Under development, somehow produtive :)
- *
- */
-
 #include <Arduino.h>
 #include "myClock.h"
 #include "display_state.h"
@@ -139,6 +134,7 @@ void showOtaStartMessage(void);
 boolean SyncNTP();
 boolean StartSyncNTP();
 void SetupWiFi(void);
+bool waitForNetworkReady(const char *hostname, unsigned long timeoutMs);
 uint8_t IntensityMap(uint16_t sensor);
 uint8_t keyboard(ClockStates key_DIR_CW, ClockStates key_DIR_CCW, ClockStates key_SW_DOWN, ClockStates key_SW_UP);
 boolean occupied(int ptrA, const int snakeLength, int *snakeX, int *snakeY);
@@ -855,6 +851,39 @@ boolean SyncNTP() {
   }
 }
 
+bool waitForNetworkReady(const char *hostname, unsigned long timeoutMs) {
+  const unsigned long deadline = millis() + timeoutMs;
+
+  while ((long)(millis() - deadline) < 0) {
+    if (WiFi.isConnected()) {
+      const IPAddress localIp = WiFi.localIP();
+      const IPAddress gatewayIp = WiFi.gatewayIP();
+      const IPAddress dnsIp = WiFi.dnsIP();
+
+      if (localIp != IPAddress((uint32_t)0) &&
+          gatewayIp != IPAddress((uint32_t)0) &&
+          dnsIp != IPAddress((uint32_t)0)) {
+        if (!hostname || hostname[0] == '\0') {
+          return true;
+        }
+
+        IPAddress resolvedIp;
+        if (WiFi.hostByName(hostname, resolvedIp) == 1 && resolvedIp != IPAddress((uint32_t)0)) {
+          return true;
+        }
+      }
+    }
+
+    delay(100);
+  }
+
+  PRINT("Network not ready. IP=", WiFi.localIP());
+  PRINT(" GW=", WiFi.gatewayIP());
+  PRINT(" DNS=", WiFi.dnsIP());
+  PRINTLN;
+  return false;
+}
+
 boolean StartSyncNTP() {
   boolean SyncError = false;
 
@@ -862,7 +891,11 @@ boolean StartSyncNTP() {
   zoneInfo0.setText("NTP Sync", _SCROLL_LEFT, _TO_LEFT, InfoTick1, I0s, I0e);
   zoneInfo0.Animate(true);
   if (WiFi.isConnected()) {
-    SyncError = !SyncNTP();
+    if (waitForNetworkReady("europe.pool.ntp.org", 8000)) {
+      SyncError = !SyncNTP();
+    } else {
+      SyncError = true;
+    }
   } else {
     PRINTS("Recovering WiFi connection\n");
     //WiFi.mode(WIFI_STA);
@@ -871,10 +904,14 @@ boolean StartSyncNTP() {
     zoneInfo0.setText("Connecting WiFi", _SCROLL_LEFT, _TO_FULL, InfoTick1, I0s, I0e);
     WiFi.begin();
     zoneInfo0.Animate(true);
-    if (WiFi.isConnected()) {
+    if (waitForNetworkReady(nullptr, 10000)) {
       zoneInfo0.setText("Connecting NTP", _SCROLL_LEFT, _TO_FULL, InfoTick1, I0s, I0e);
-      SyncError = !SyncNTP();
       zoneInfo0.Animate(true);
+      if (waitForNetworkReady("europe.pool.ntp.org", 8000)) {
+        SyncError = !SyncNTP();
+      } else {
+        SyncError = true;
+      }
       //WiFi.mode(WIFI_OFF);
     } else {
       SyncError = true;  // wifi failure
@@ -1011,6 +1048,7 @@ void SetupWiFi(void) {
   PRINTS("IP address: \n");
   PRINTS(WiFi.localIP());
   PRINTLN;
+  waitForNetworkReady(nullptr, 8000);
 }
 
 uint8_t IntensityMap(uint16_t sensor) {
