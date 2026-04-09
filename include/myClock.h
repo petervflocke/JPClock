@@ -172,6 +172,14 @@ typedef float pres_t;
 #define RemoteMessageRepeatDelay 2500
 /* How long the HDD arm may move for one remote message. */
 #define RemoteMessageMotionMs 10000
+/* Alarm replay cadence and burst count. */
+#define AlarmRepeatDelayMs 70000
+#define AlarmTotalBursts 3
+#define AlarmFinalDisplayMs AlarmRepeatDelayMs
+#define AlarmAnimationTick 130
+#define AlarmTextHoldTicks 8
+#define AlarmSoundFolder 3
+#define AlarmSoundFirstTrack 103
 
 /* Interval for checking ambient light and adjusting display brightness. */
 #define IntensityWait 250
@@ -243,6 +251,10 @@ enum ClockStates
    _Clock_display_off,
    _Clock_Temp_init,
    _Clock_Temp,
+   _Clock_alarm_menu_init,
+   _Clock_alarm_menu,
+   _Clock_alarm_active_init,
+   _Clock_alarm_active,
    _Clock_ip_init,
    _Clock_ip,
    _Clock_wake_greeting_init,

@@ -8,6 +8,7 @@
 #include <Adafruit_GFX.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WebServer.h>
 
 // OTA
 #include <ESPmDNS.h>
@@ -101,6 +102,9 @@ Schedular RemoteMessageRepeat(_Millis);
 Schedular RemoteMessageMotion(_Millis);
 Schedular DisplayOffFade(_Millis);
 Schedular WakeGreetingDisplay(_Millis);
+Schedular AlarmRepeat(_Millis);
+Schedular AlarmAnimation(_Millis);
+Schedular AlarmFinalDisplay(_Millis);
 
 // MP3 Player
 HardwareSerial DFPSerial(1);
@@ -121,6 +125,7 @@ Adafruit_MQTT_Publish brigMQTT = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME feedB
 Adafruit_MQTT_Publish onofMQTT = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME feedOnOf);
 Adafruit_MQTT_Publish dataMQTT = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME feedData);
 Adafruit_MQTT_Publish msgMQTTPub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME feedMsg);
+WebServer webServer(80);
 
 // Setup a feed for subscribing to changes.
 Adafruit_MQTT_Subscribe ledMQTT = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME feedLED);
@@ -183,6 +188,40 @@ bool fetchLastRemoteMessage(String &message);
 String extractJsonStringField(const String &json, const char *fieldName);
 bool isRemoteMessageEmpty(const char *message);
 bool isRemoteMessageEmpty(const String &message);
+void rememberLastRemoteMessage(const char *message);
+bool copyLastRemoteMessage(String &message);
+String formatAlarmTime(uint8_t hourValue, uint8_t minuteValue);
+String buildAlarmMenuText();
+void refreshAlarmMenuText(DisplayState &display);
+void restoreDisplayOutput(DisplayState &display);
+bool isAlarmState(ClockStates state);
+bool isAlarmActiveState(ClockStates state);
+void startAlarmTakeover(DisplayState &display, ClockStates returnState);
+void triggerAlarmBurst(DisplayState &display);
+void drawAlarmAnimation(DisplayState &display, bool forceRedraw);
+void finishAlarmTakeover(DisplayState &display, bool stopAudio);
+bool parseAlarmTimeValue(const String &value, uint8_t &hourValue, uint8_t &minuteValue);
+void setAlarmConfig(bool enabled, uint8_t hourValue, uint8_t minuteValue, bool persist);
+void stopDfPlayerPlayback();
+bool applyRemoteAlarmCommand(const char *message);
+void applyQueuedAlarmCommand();
+void processIncomingRemoteMessage(const char *message);
+String clockModeName(ClockStates state);
+bool applyRequestedMode(const String &mode, String &error);
+String jsonEscape(const String &value);
+String buildWebStatusJson();
+void sendJsonResponse(int statusCode, const String &body);
+void setupWebServer();
+void handleWebRoot();
+void handleWebStatus();
+void handleWebAlarmSave();
+void handleWebAlarmStop();
+void handleWebMode();
+ClockStates resolveModeChangeCoilReadyState(ClockStates state);
+void armModeChangeCoilPulse(ClockStates targetState);
+void cancelModeChangeCoilPulse();
+void triggerModeChangeCoilPulse();
+void updatePendingModeChangeCoilPulse();
 void wakeDisplayToMenu(DisplayState &display);
 
 
@@ -199,20 +238,35 @@ char pendingRemoteMessage[161] = "";
 char activeRemoteMessage[161] = "";
 char pendingRemoteAck[96] = "";
 char pendingRemoteClearMessage[161] = "";
+char lastKnownRemoteMessage[161] = "";
+char pendingAlarmCommand[32] = "";
 bool remoteMessagePending = false;
 bool remoteMessageActive = false;
 bool remoteMessageAckPending = false;
 bool remoteMessageClearPending = false;
+bool alarmCommandPending = false;
 bool remoteMessageWaitingForRepeat = false;
 bool remoteMessageMotionActive = false;
 bool clockReadyForRemoteMessages = false;
 ClockStates remoteMessageReturnState = _Clock_complete_info_init;
+ClockStates alarmReturnState = _Clock_complete_info_init;
 bool morningGreetingShownToday = false;
 bool afternoonGreetingShownToday = false;
 uint32_t wakeGreetingDayKey = 0;
 char wakeGreetingMessage[32] = "";
 uint8_t wakeGreetingSoundFolder = 0;
 uint16_t wakeGreetingSoundFile = 0;
+bool alarmEnabled = false;
+uint8_t alarmHour = 7;
+uint8_t alarmMinute = 0;
+uint32_t alarmLastTriggeredDayKey = 0;
+uint16_t alarmLastTriggeredMinuteOfDay = 0xFFFF;
+uint8_t alarmBurstCount = 0;
+uint8_t alarmAnimationFrame = 0;
+bool alarmFinalReturnPending = false;
+bool modeChangeCoilPulsePending = false;
+ClockStates modeChangeCoilPulseReadyState = _Clock_none;
+unsigned long lastModeChangeCoilPulseAt = 0;
 
 #if EnableSoundTestMode
 struct SoundTestCatalogEntry {
@@ -261,12 +315,15 @@ SkyStarsMode skyStarsMode;
 #define voiceCoilMotionMinMs 45
 #define voiceCoilMotionMaxMs 120
 #define voiceCoilHighPulseChance 6
+#define voiceCoilModeChangePulseCooldownMs 250
 
 enum VoiceCoilState : uint8_t {
   _vcOff,
   _vcKickHigh,
   _vcKickRelease,
-  _vcRandomMotion
+  _vcRandomMotion,
+  _vcModePulseHigh,
+  _vcModePulseRelease
 };
 
 VoiceCoilState voiceCoilState = _vcOff;
@@ -311,6 +368,12 @@ ClockStates normalizeClockStateForReturn(ClockStates state) {
     case _Clock_Temp_init:
     case _Clock_Temp:
       return _Clock_Temp_init;
+    case _Clock_alarm_menu_init:
+    case _Clock_alarm_menu:
+      return _Clock_alarm_menu_init;
+    case _Clock_alarm_active_init:
+    case _Clock_alarm_active:
+      return alarmReturnState;
     case _Clock_ip_init:
     case _Clock_ip:
       return _Clock_ip_init;
@@ -342,8 +405,273 @@ ClockStates normalizeClockStateForReturn(ClockStates state) {
   }
 }
 
+ClockStates resolveModeChangeCoilReadyState(ClockStates state) {
+  switch (state) {
+    case _Clock_simple_time_init:
+    case _Clock_simple_time:
+      return _Clock_simple_time;
+    case _Clock_complete_info_init:
+    case _Clock_complete_info:
+      return _Clock_complete_info;
+    case _Clock_Temp_init:
+    case _Clock_Temp:
+      return _Clock_Temp;
+    case _Clock_alarm_menu_init:
+    case _Clock_alarm_menu:
+      return _Clock_alarm_menu;
+    case _Clock_ip_init:
+    case _Clock_ip:
+      return _Clock_ip;
+    case _Clock_menu_init:
+    case _Clock_menu:
+      return _Clock_menu;
+    case _Clock_menu_display_init:
+    case _Clock_menu_display:
+      return _Clock_menu_display;
+    case _Clock_sky_stars_init:
+    case _Clock_sky_stars:
+      return _Clock_sky_stars;
+    case _Clock_display_off_init:
+    case _Clock_display_off:
+      return _Clock_display_off;
+#if EnableSoundTestMode
+    case _Clock_sound_test_init:
+    case _Clock_sound_test:
+      return _Clock_sound_test;
+#endif
+    default:
+      return _Clock_none;
+  }
+}
+
+bool isClockStateInitState(ClockStates state) {
+  switch (state) {
+    case _Clock_simple_time_init:
+    case _Clock_complete_info_init:
+    case _Clock_Temp_init:
+    case _Clock_alarm_menu_init:
+    case _Clock_alarm_active_init:
+    case _Clock_ip_init:
+    case _Clock_menu_init:
+    case _Clock_menu_display_init:
+    case _Clock_sky_stars_init:
+    case _Clock_display_off_init:
+    case _Clock_wake_greeting_init:
+    case _Clock_remote_message_init:
+#if EnableSoundTestMode
+    case _Clock_sound_test_init:
+#endif
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isAlarmState(ClockStates state) {
+  return state == _Clock_alarm_menu_init || state == _Clock_alarm_menu
+         || state == _Clock_alarm_active_init || state == _Clock_alarm_active;
+}
+
+bool isAlarmActiveState(ClockStates state) {
+  return state == _Clock_alarm_active_init || state == _Clock_alarm_active;
+}
+
+String formatAlarmTime(uint8_t hourValue, uint8_t minuteValue) {
+  char timeBuffer[6];
+  snprintf(timeBuffer, sizeof(timeBuffer), "%02u:%02u", hourValue, minuteValue);
+  return String(timeBuffer);
+}
+
+String buildAlarmMenuText() {
+  return formatAlarmTime(alarmHour, alarmMinute) + (alarmEnabled ? " ON" : " OFF");
+}
+
+String clockModeName(ClockStates state) {
+  switch (state) {
+    case _Clock_complete_info_init:
+    case _Clock_complete_info:
+      return "normal";
+    case _Clock_simple_time_init:
+    case _Clock_simple_time:
+      return "snake";
+    case _Clock_sky_stars_init:
+    case _Clock_sky_stars:
+      return "sky";
+    case _Clock_display_off_init:
+    case _Clock_display_off:
+      return "off";
+    case _Clock_Temp_init:
+    case _Clock_Temp:
+      return "temp";
+    case _Clock_alarm_menu_init:
+    case _Clock_alarm_menu:
+      return "alarm-menu";
+    case _Clock_alarm_active_init:
+    case _Clock_alarm_active:
+      return "alarm-active";
+    case _Clock_menu_init:
+    case _Clock_menu:
+      return "ding";
+    case _Clock_menu_display_init:
+    case _Clock_menu_display:
+      return "led";
+    case _Clock_ip_init:
+    case _Clock_ip:
+      return "ip";
+    case _Clock_remote_message_init:
+    case _Clock_remote_message:
+      return "remote-message";
+    case _Clock_wake_greeting_init:
+    case _Clock_wake_greeting:
+      return "wake-greeting";
+#if EnableSoundTestMode
+    case _Clock_sound_test_init:
+    case _Clock_sound_test:
+      return "sound-test";
+#endif
+    case _Clock_NTP_Sync:
+      return "ntp-sync";
+    default:
+      return "unknown";
+  }
+}
+
 uint32_t buildLocalDateKey(time_t localTime) {
   return (uint32_t)year(localTime) * 10000UL + (uint32_t)month(localTime) * 100UL + (uint32_t)day(localTime);
+}
+
+void restoreDisplayOutput(DisplayState &display) {
+  displayEnabled = true;
+  screenSaverNotActive = true;
+  digitalWrite(sledPin, LOW);
+  matrix.shutdown(false);
+  ScreenSaver.start();
+  const uint16_t lux = lightMeter.readLightLevel();
+  display.intensity = IntensityMap(lux);
+  display.lintensity = display.intensity;
+  matrix.setIntensity(display.intensity);
+}
+
+void refreshAlarmMenuText(DisplayState &display) {
+  display.paramS = buildAlarmMenuText();
+  zoneInfo0.setText(display.paramS, _BLINK, _NONE_MOD, InfoSlow, I0s, I0e);
+}
+
+bool parseAlarmTimeValue(const String &value, uint8_t &hourValue, uint8_t &minuteValue) {
+  String trimmed = value;
+  trimmed.trim();
+  const int separator = trimmed.indexOf(':');
+  if (separator <= 0 || separator >= trimmed.length() - 1) return false;
+
+  const int parsedHour = trimmed.substring(0, separator).toInt();
+  const int parsedMinute = trimmed.substring(separator + 1).toInt();
+  if (parsedHour < 0 || parsedHour > 23 || parsedMinute < 0 || parsedMinute > 59) return false;
+
+  hourValue = (uint8_t)parsedHour;
+  minuteValue = (uint8_t)parsedMinute;
+  return true;
+}
+
+void setAlarmConfig(bool enabled, uint8_t hourValue, uint8_t minuteValue, bool persist) {
+  alarmEnabled = enabled;
+  alarmHour = hourValue;
+  alarmMinute = minuteValue;
+  if (persist) savePreferences();
+}
+
+bool applyRequestedMode(const String &mode, String &error) {
+  String normalized = mode;
+  normalized.trim();
+  normalized.toLowerCase();
+
+  if (isAlarmActiveState(ClockState)) {
+    error = "alarm active";
+    return false;
+  }
+
+  if (normalized == "off") {
+    if (resolveModeChangeCoilReadyState(ClockState) == _Clock_display_off) return true;
+    ClockState = _Clock_display_off_init;
+    armModeChangeCoilPulse(_Clock_display_off_init);
+    return true;
+  }
+
+  if (normalized == "normal") {
+    if (resolveModeChangeCoilReadyState(ClockState) == _Clock_complete_info) return true;
+    restoreDisplayOutput(displayState);
+    ClockState = _Clock_complete_info_init;
+    armModeChangeCoilPulse(_Clock_complete_info_init);
+    return true;
+  }
+
+  if (normalized == "snake") {
+    if (resolveModeChangeCoilReadyState(ClockState) == _Clock_simple_time) return true;
+    restoreDisplayOutput(displayState);
+    ClockState = _Clock_simple_time_init;
+    armModeChangeCoilPulse(_Clock_simple_time_init);
+    return true;
+  }
+
+  if (normalized == "sky") {
+    if (resolveModeChangeCoilReadyState(ClockState) == _Clock_sky_stars) return true;
+    restoreDisplayOutput(displayState);
+    ClockState = _Clock_sky_stars_init;
+    armModeChangeCoilPulse(_Clock_sky_stars_init);
+    return true;
+  }
+
+  error = "unsupported mode";
+  return false;
+}
+
+void armModeChangeCoilPulse(ClockStates targetState) {
+  const ClockStates readyState = resolveModeChangeCoilReadyState(targetState);
+  if (readyState == _Clock_none) return;
+
+  modeChangeCoilPulseReadyState = readyState;
+  modeChangeCoilPulsePending = true;
+}
+
+void cancelModeChangeCoilPulse() {
+  modeChangeCoilPulsePending = false;
+  modeChangeCoilPulseReadyState = _Clock_none;
+}
+
+void triggerModeChangeCoilPulse() {
+  const unsigned long now = millis();
+  if (now - lastModeChangeCoilPulseAt < voiceCoilModeChangePulseCooldownMs) return;
+
+  lastModeChangeCoilPulseAt = now;
+  voiceCoilState = _vcModePulseHigh;
+  setVoiceCoilLevel(voiceCoilKick);
+  voiceCoilPeriod = voiceCoilKickMs;
+  VoiceCoilMotion.start();
+}
+
+void updatePendingModeChangeCoilPulse() {
+  if (!modeChangeCoilPulsePending) return;
+
+  switch (ClockState) {
+    case _Clock_remote_message_init:
+    case _Clock_remote_message:
+    case _Clock_alarm_active_init:
+    case _Clock_alarm_active:
+    case _Clock_NTP_Sync:
+      cancelModeChangeCoilPulse();
+      return;
+    default:
+      break;
+  }
+
+  if (ClockState == modeChangeCoilPulseReadyState) {
+    triggerModeChangeCoilPulse();
+    cancelModeChangeCoilPulse();
+    return;
+  }
+
+  if (!isClockStateInitState(ClockState)) {
+    cancelModeChangeCoilPulse();
+  }
 }
 
 void resetWakeGreetingFlagsIfNeeded(time_t localTime) {
@@ -421,6 +749,14 @@ bool prepareWakeGreeting(time_t localTime, unsigned long inactivityMs) {
   return false;
 }
 
+void stopDfPlayerPlayback() {
+  DFPlayer.disableLoop();
+  DFPlayer.disableLoopAll();
+  DFPlayer.stopAdvertise();
+  DFPlayer.stop();
+  DFPlayer.pause();
+}
+
 #if EnableSoundTestMode
 void resetSoundTestSelection() {
   soundTestCatalogIndex = 0;
@@ -454,23 +790,133 @@ void playCurrentSoundTestSelection() {
 }
 
 void stopSoundTestPlayback() {
-  DFPlayer.stop();
+  stopDfPlayerPlayback();
 }
 #endif
 
 void wakeDisplayToMenu(DisplayState &display) {
-  displayEnabled = true;
-  matrix.shutdown(false);
   const uint16_t lux = lightMeter.readLightLevel();
-  display.intensity = IntensityMap(lux);
+  restoreDisplayOutput(display);
   PRINT_BRIGHTNESS("[Brightness] wake lux=");
   PRINT_BRIGHTNESS_VALUE("", lux);
   PRINT_BRIGHTNESS_VALUE(" mapped=", display.intensity);
   PRINT_BRIGHTNESS_LN();
-  display.lintensity = display.intensity;
-  matrix.setIntensity(display.intensity);
-  screenSaverNotActive = true;
   ClockState = _Clock_menu_display_init;
+}
+
+void rememberLastRemoteMessage(const char *message) {
+  if (!message || isRemoteMessageEmpty(message)) return;
+
+  if (!messageMutex) {
+    strncpy(lastKnownRemoteMessage, message, sizeof(lastKnownRemoteMessage) - 1);
+    lastKnownRemoteMessage[sizeof(lastKnownRemoteMessage) - 1] = '\0';
+    return;
+  }
+
+  xSemaphoreTake(messageMutex, portMAX_DELAY);
+  strncpy(lastKnownRemoteMessage, message, sizeof(lastKnownRemoteMessage) - 1);
+  lastKnownRemoteMessage[sizeof(lastKnownRemoteMessage) - 1] = '\0';
+  xSemaphoreGive(messageMutex);
+}
+
+bool copyLastRemoteMessage(String &message) {
+  char messageCopy[sizeof(lastKnownRemoteMessage)];
+
+  if (!messageMutex) {
+    message = String(lastKnownRemoteMessage);
+    return !isRemoteMessageEmpty(message);
+  }
+
+  xSemaphoreTake(messageMutex, portMAX_DELAY);
+  strncpy(messageCopy, lastKnownRemoteMessage, sizeof(messageCopy) - 1);
+  messageCopy[sizeof(messageCopy) - 1] = '\0';
+  xSemaphoreGive(messageMutex);
+
+  message = String(messageCopy);
+  return !isRemoteMessageEmpty(message);
+}
+
+bool applyRemoteAlarmCommand(const char *message) {
+  if (!message || isRemoteMessageEmpty(message)) return false;
+
+  String command = message;
+  command.trim();
+  String lowerCommand = command;
+  lowerCommand.toLowerCase();
+  if (!lowerCommand.startsWith("alarm:")) return false;
+
+  if (!messageMutex) {
+    strncpy(pendingAlarmCommand, message, sizeof(pendingAlarmCommand) - 1);
+    pendingAlarmCommand[sizeof(pendingAlarmCommand) - 1] = '\0';
+    alarmCommandPending = true;
+    return true;
+  }
+
+  xSemaphoreTake(messageMutex, portMAX_DELAY);
+  strncpy(pendingAlarmCommand, message, sizeof(pendingAlarmCommand) - 1);
+  pendingAlarmCommand[sizeof(pendingAlarmCommand) - 1] = '\0';
+  alarmCommandPending = true;
+  xSemaphoreGive(messageMutex);
+  return true;
+}
+
+void applyQueuedAlarmCommand() {
+  char commandCopy[sizeof(pendingAlarmCommand)];
+  bool hasCommand = false;
+
+  if (!messageMutex) {
+    if (alarmCommandPending) {
+      strncpy(commandCopy, pendingAlarmCommand, sizeof(commandCopy) - 1);
+      commandCopy[sizeof(commandCopy) - 1] = '\0';
+      pendingAlarmCommand[0] = '\0';
+      alarmCommandPending = false;
+      hasCommand = true;
+    }
+  } else {
+    xSemaphoreTake(messageMutex, portMAX_DELAY);
+    if (alarmCommandPending) {
+      strncpy(commandCopy, pendingAlarmCommand, sizeof(commandCopy) - 1);
+      commandCopy[sizeof(commandCopy) - 1] = '\0';
+      pendingAlarmCommand[0] = '\0';
+      alarmCommandPending = false;
+      hasCommand = true;
+    }
+    xSemaphoreGive(messageMutex);
+  }
+
+  if (!hasCommand) return;
+
+  String command = commandCopy;
+  command.trim();
+  String payload = command.substring(6);
+  payload.trim();
+  String lowerPayload = payload;
+  lowerPayload.toLowerCase();
+
+  if (lowerPayload == "off") {
+    setAlarmConfig(false, alarmHour, alarmMinute, true);
+    queueRemoteMessageAck("Alarm Off");
+    queueRemoteMessageClear(commandCopy);
+    if (isAlarmActiveState(ClockState)) finishAlarmTakeover(displayState, true);
+    return;
+  }
+
+  uint8_t newHour = alarmHour;
+  uint8_t newMinute = alarmMinute;
+  if (parseAlarmTimeValue(payload, newHour, newMinute)) {
+    setAlarmConfig(true, newHour, newMinute, true);
+    const String ackMessage = "Alarm " + formatAlarmTime(newHour, newMinute);
+    queueRemoteMessageAck(ackMessage.c_str());
+  } else {
+    queueRemoteMessageAck("Alarm command invalid");
+  }
+  queueRemoteMessageClear(commandCopy);
+}
+
+void processIncomingRemoteMessage(const char *message) {
+  rememberLastRemoteMessage(message);
+  if (applyRemoteAlarmCommand(message)) return;
+  queueRemoteMessage(message);
 }
 
 void queueRemoteMessage(const char *message) {
@@ -711,6 +1157,434 @@ bool fetchLastRemoteMessage(String &message) {
   return true;
 }
 
+static const char WEB_PAGE[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JPClock</title>
+<style>
+:root{--bg:#0d1114;--panel:#151c22;--line:#26323d;--accent:#ff7a18;--accent-soft:#ffd166;--text:#f5efe2;--muted:#98a8b7;--danger:#ff5c5c}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(circle at top,#4a2410 0,transparent 28%),linear-gradient(180deg,#10161c,#080b0e);color:var(--text);font:16px/1.45 "Courier New","Lucida Console",monospace}
+main{max-width:960px;margin:0 auto;padding:24px 16px 40px;display:grid;gap:16px}
+.hero{padding:18px 20px;border:1px solid var(--line);background:linear-gradient(135deg,rgba(255,122,24,.18),rgba(255,209,102,.06) 55%,rgba(21,28,34,.96));border-radius:18px}
+.eyebrow{margin:0 0 8px;color:var(--accent-soft);text-transform:uppercase;letter-spacing:.18em;font-size:.82rem}
+h1{margin:0 0 8px;font-size:clamp(30px,6vw,44px);letter-spacing:.08em;text-transform:uppercase}
+.sub{margin:0;color:var(--muted);max-width:52rem}
+.panel{border:1px solid var(--line);background:linear-gradient(180deg,rgba(21,28,34,.96),rgba(11,15,19,.98));border-radius:18px;padding:18px}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.stat{padding:14px;border:1px solid rgba(255,255,255,.05);border-radius:14px;background:rgba(255,255,255,.02)}
+.stat span{display:block;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.12em;margin-bottom:6px}
+.stat strong{display:block;font-size:1.3rem;color:var(--accent-soft)}
+h2{margin:0 0 12px;font-size:1rem;letter-spacing:.12em;text-transform:uppercase;color:var(--accent-soft)}
+.alarm-form{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));align-items:end}
+.alarm-time-fields{display:grid;gap:10px;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:end}
+.alarm-time-fields label{margin:0}
+.time-colon{align-self:end;padding:0 2px 12px;color:var(--accent-soft);font-size:1.5rem;line-height:1}
+label{display:grid;gap:8px;color:var(--muted);font-size:.9rem}
+input[type=number]{appearance:none;border:1px solid var(--line);border-radius:12px;background:#0d1318;color:var(--text);padding:12px 14px;font:inherit;width:100%}
+.toggle{display:flex;align-items:center;gap:10px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:#0d1318;color:var(--text)}
+.toggle input{width:18px;height:18px}
+.actions{display:flex;flex-wrap:wrap;gap:10px}
+button{border:1px solid rgba(255,122,24,.35);border-radius:999px;padding:12px 16px;background:linear-gradient(180deg,rgba(255,122,24,.18),rgba(255,122,24,.08));color:var(--text);font:inherit;letter-spacing:.08em;text-transform:uppercase;cursor:pointer}
+button:hover{border-color:rgba(255,209,102,.6)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.danger{border-color:rgba(255,92,92,.45);background:linear-gradient(180deg,rgba(255,92,92,.2),rgba(255,92,92,.08))}
+.note{min-height:1.3em;margin:8px 0 0;color:var(--muted)}
+pre{margin:0;min-height:3.2em;white-space:pre-wrap;word-break:break-word;border:1px solid rgba(255,255,255,.05);border-radius:14px;background:#0b1014;padding:14px;color:#ffd9b0}
+@media (max-width:640px){main{padding:16px 12px 28px}.panel,.hero{padding:16px}}
+</style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <p class="eyebrow">LAN Console</p>
+    <h1>JPClock</h1>
+  </section>
+
+  <section class="panel grid">
+    <div class="stat"><span>Local time</span><strong id="local-time">--</strong></div>
+    <div class="stat"><span>Mode</span><strong id="mode-name">--</strong></div>
+    <div class="stat"><span>Display</span><strong id="display-state">--</strong></div>
+    <div class="stat"><span>Alarm</span><strong id="alarm-state">--</strong></div>
+    <div class="stat"><span>Temperature</span><strong id="sensor-temp">--</strong></div>
+    <div class="stat"><span>Humidity</span><strong id="sensor-humi">--</strong></div>
+    <div class="stat"><span>Pressure</span><strong id="sensor-pres">--</strong></div>
+    <div class="stat"><span>Brightness</span><strong id="sensor-light">--</strong></div>
+  </section>
+
+  <section class="panel">
+    <h2>Alarm Setup</h2>
+    <form id="alarm-form" class="alarm-form">
+      <div class="alarm-time-fields">
+        <label>Hour
+          <input id="alarm-hour" type="number" min="0" max="23" step="1" inputmode="numeric" required>
+        </label>
+        <div class="time-colon">:</div>
+        <label>Minute
+          <input id="alarm-minute" type="number" min="0" max="59" step="1" inputmode="numeric" required>
+        </label>
+      </div>
+      <label class="toggle">
+        <input id="alarm-enabled" name="enabled" type="checkbox" value="1">
+        <span>Alarm enabled</span>
+      </label>
+      <button type="submit">Save Alarm</button>
+      <button id="alarm-stop" class="danger" type="button">Stop Alarm</button>
+    </form>
+    <p id="alarm-note" class="note"></p>
+  </section>
+
+  <section class="panel">
+    <h2>Clock Modes</h2>
+    <div class="actions">
+      <button data-mode="normal" type="button">Normal</button>
+      <button data-mode="snake" type="button">Snake</button>
+      <button data-mode="sky" type="button">Sky</button>
+      <button data-mode="off" class="danger" type="button">Display Off</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Last Message</h2>
+    <pre id="last-message">No stored message</pre>
+  </section>
+</main>
+<script>
+const $ = (selector) => document.querySelector(selector);
+const modeButtons = [...document.querySelectorAll('[data-mode]')];
+const alarmForm = $('#alarm-form');
+const alarmEditorFields = [$('#alarm-hour'), $('#alarm-minute'), $('#alarm-enabled')];
+let alarmFormDirty = false;
+let alarmFormEditing = false;
+function note(text, bad = false) {
+  const node = $('#alarm-note');
+  node.textContent = text;
+  node.style.color = bad ? 'var(--danger)' : 'var(--muted)';
+}
+function syncAlarmEditor(status) {
+  if (alarmFormDirty || alarmFormEditing) return;
+  const [hour, minute] = status.alarmTime.split(':');
+  $('#alarm-hour').value = hour;
+  $('#alarm-minute').value = minute;
+  $('#alarm-enabled').checked = status.alarmEnabled;
+}
+function paint(status) {
+  $('#local-time').textContent = status.localTime;
+  $('#mode-name').textContent = status.mode;
+  $('#display-state').textContent = !status.displayEnabled ? 'Manual off' : (status.displayVisible ? 'Visible' : 'Screen saver');
+  $('#alarm-state').textContent = status.alarmActive ? 'Burst ' + status.alarmBurstsUsed + '/' + status.alarmBurstsTotal : (status.alarmEnabled ? status.alarmTime + ' on' : status.alarmTime + ' off');
+  $('#sensor-temp').textContent = status.temperature.toFixed(1) + ' C';
+  $('#sensor-humi').textContent = status.humidity.toFixed(1) + ' %';
+  $('#sensor-pres').textContent = status.pressure.toFixed(1) + ' hPa';
+  $('#sensor-light').textContent = status.brightness.toFixed(0) + ' lx';
+  syncAlarmEditor(status);
+  $('#alarm-stop').disabled = !status.alarmActive;
+  $('#last-message').textContent = status.lastMessage || 'No stored message';
+}
+async function refresh() {
+  try {
+    const response = await fetch('/api/status', { cache: 'no-store' });
+    const status = await response.json();
+    paint(status);
+  } catch (error) {
+    note('Clock did not answer: ' + error.message, true);
+  }
+}
+async function post(url, data) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(data)
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  const status = await response.json();
+  paint(status);
+}
+alarmEditorFields.forEach((field) => {
+  field.addEventListener('input', () => {
+    alarmFormDirty = true;
+  });
+});
+alarmForm.addEventListener('focusin', () => {
+  alarmFormEditing = true;
+});
+alarmForm.addEventListener('focusout', () => {
+  setTimeout(() => {
+    alarmFormEditing = alarmForm.contains(document.activeElement);
+  }, 0);
+});
+$('#alarm-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const hourValue = Number($('#alarm-hour').value);
+  const minuteValue = Number($('#alarm-minute').value);
+  if (!Number.isInteger(hourValue) || hourValue < 0 || hourValue > 23
+      || !Number.isInteger(minuteValue) || minuteValue < 0 || minuteValue > 59) {
+    note('Use 24-hour values: hour 0-23 and minute 0-59.', true);
+    return;
+  }
+  try {
+    await post('/api/alarm/save', {
+      time: String(hourValue).padStart(2, '0') + ':' + String(minuteValue).padStart(2, '0'),
+      enabled: $('#alarm-enabled').checked ? '1' : '0'
+    });
+    alarmFormDirty = false;
+    alarmFormEditing = false;
+    note('Alarm settings saved.');
+  } catch (error) {
+    note(error.message, true);
+  }
+});
+$('#alarm-stop').addEventListener('click', async () => {
+  try {
+    await post('/api/alarm/stop', {});
+    note('Alarm stopped.');
+  } catch (error) {
+    note(error.message, true);
+  }
+});
+modeButtons.forEach((button) => {
+  button.addEventListener('click', async () => {
+    try {
+      await post('/api/mode', { mode: button.dataset.mode });
+      note('Mode changed to ' + button.dataset.mode + '.');
+    } catch (error) {
+      note(error.message, true);
+    }
+  });
+});
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
+)HTML";
+
+String jsonEscape(const String &value) {
+  String escaped;
+  escaped.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); i++) {
+    const char c = value.charAt(i);
+    switch (c) {
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '"':
+        escaped += "\\\"";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\r':
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      default:
+        escaped += c;
+        break;
+    }
+  }
+  return escaped;
+}
+
+String buildWebStatusJson() {
+  float tempValue = _t;
+  float humiValue = _h;
+  float presValue = _p;
+  float lightValue = _l;
+  if (bufMutex) {
+    xSemaphoreTake(bufMutex, portMAX_DELAY);
+    tempValue = _t;
+    humiValue = _h;
+    presValue = _p;
+    lightValue = _l;
+    xSemaphoreGive(bufMutex);
+  }
+
+  String lastMessage;
+  copyLastRemoteMessage(lastMessage);
+  String json;
+  json.reserve(512);
+  json += "{";
+  json += "\"localTime\":\"" + jsonEscape(formatLocalTimeStamp(now())) + "\",";
+  json += "\"mode\":\"" + jsonEscape(clockModeName(ClockState)) + "\",";
+  json += "\"displayEnabled\":";
+  json += (displayEnabled ? "true" : "false");
+  json += ",\"displayVisible\":";
+  json += ((displayEnabled && screenSaverNotActive) ? "true" : "false");
+  json += ",\"temperature\":";
+  json += String(tempValue, 1);
+  json += ",\"humidity\":";
+  json += String(humiValue, 1);
+  json += ",\"pressure\":";
+  json += String(presValue, 1);
+  json += ",\"brightness\":";
+  json += String(lightValue, 0);
+  json += ",\"alarmEnabled\":";
+  json += (alarmEnabled ? "true" : "false");
+  json += ",\"alarmTime\":\"" + formatAlarmTime(alarmHour, alarmMinute) + "\",";
+  json += "\"alarmActive\":";
+  json += (isAlarmActiveState(ClockState) ? "true" : "false");
+  json += ",\"alarmBurstsUsed\":";
+  json += String(alarmBurstCount);
+  json += ",\"alarmBurstsTotal\":";
+  json += String(AlarmTotalBursts);
+  json += ",\"lastMessage\":\"" + jsonEscape(lastMessage) + "\"";
+  json += "}";
+  return json;
+}
+
+void sendJsonResponse(int statusCode, const String &body) {
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(statusCode, "application/json; charset=utf-8", body);
+}
+
+void handleWebRoot() {
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send_P(200, "text/html; charset=utf-8", WEB_PAGE);
+}
+
+void handleWebStatus() {
+  sendJsonResponse(200, buildWebStatusJson());
+}
+
+void handleWebAlarmSave() {
+  const String timeValue = webServer.arg("time");
+  uint8_t newHour = alarmHour;
+  uint8_t newMinute = alarmMinute;
+  if (!parseAlarmTimeValue(timeValue, newHour, newMinute)) {
+    sendJsonResponse(400, "{\"error\":\"invalid alarm time\"}");
+    return;
+  }
+
+  bool enabled = webServer.hasArg("enabled");
+  if (enabled) {
+    String enabledValue = webServer.arg("enabled");
+    enabledValue.toLowerCase();
+    if (enabledValue == "0" || enabledValue == "false" || enabledValue == "off") enabled = false;
+  }
+
+  setAlarmConfig(enabled, newHour, newMinute, true);
+  if (!enabled && isAlarmActiveState(ClockState)) finishAlarmTakeover(displayState, true);
+  sendJsonResponse(200, buildWebStatusJson());
+}
+
+void handleWebAlarmStop() {
+  if (isAlarmActiveState(ClockState)) finishAlarmTakeover(displayState, true);
+  sendJsonResponse(200, buildWebStatusJson());
+}
+
+void handleWebMode() {
+  String error;
+  if (!applyRequestedMode(webServer.arg("mode"), error)) {
+    const int statusCode = error == "alarm active" ? 409 : 400;
+    sendJsonResponse(statusCode, "{\"error\":\"" + jsonEscape(error) + "\"}");
+    return;
+  }
+  sendJsonResponse(200, buildWebStatusJson());
+}
+
+void setupWebServer() {
+  webServer.on("/", HTTP_GET, handleWebRoot);
+  webServer.on("/api/status", HTTP_GET, handleWebStatus);
+  webServer.on("/api/alarm/save", HTTP_POST, handleWebAlarmSave);
+  webServer.on("/api/alarm/stop", HTTP_POST, handleWebAlarmStop);
+  webServer.on("/api/mode", HTTP_POST, handleWebMode);
+  webServer.onNotFound([]() {
+    if (webServer.uri().startsWith("/api/")) {
+      sendJsonResponse(404, "{\"error\":\"not found\"}");
+    } else {
+      webServer.send(404, "text/plain; charset=utf-8", "Not found");
+    }
+  });
+  webServer.begin();
+}
+
+void drawAlarmAnimation(DisplayState &display, bool forceRedraw) {
+  if (!forceRedraw && !AlarmAnimation.check(AlarmAnimationTick)) return;
+
+  if (!forceRedraw) {
+    alarmAnimationFrame = (alarmAnimationFrame + 1) % (AlarmTextHoldTicks * 2);
+  }
+
+  static const uint8_t outerX[] = {13, 10, 7, 4, 7, 10};
+  static const uint8_t outerY[] = {3, 2, 1, 0, 1, 2};
+  static const uint8_t outerH[] = {2, 4, 6, 8, 6, 4};
+  static const uint8_t innerX[] = {15, 12, 9, 6, 9, 12};
+  static const uint8_t innerY[] = {3, 2, 2, 1, 2, 2};
+  static const uint8_t innerH[] = {2, 4, 4, 6, 4, 4};
+
+  const uint8_t pulsePhase = alarmAnimationFrame % 6;
+  const bool showAlarmText = ((alarmAnimationFrame / AlarmTextHoldTicks) % 2U) == 0;
+  const String text = showAlarmText ? "ALARM" : formatAlarmTime(alarmHour, alarmMinute);
+  const int16_t textWidth = (int16_t)text.length() * 6;
+  int16_t textX = (matrix.width() - textWidth) / 2;
+  if (textX < 0) textX = 0;
+
+  matrix.setClip(0, matrix.width(), 0, matrix.height());
+  matrix.fillScreen(LOW);
+  matrix.setCursor(textX, 0);
+  matrix.print(text);
+
+  matrix.drawFastVLine(outerX[pulsePhase], outerY[pulsePhase], outerH[pulsePhase], HIGH);
+  matrix.drawFastVLine(matrix.width() - 1 - outerX[pulsePhase], outerY[pulsePhase], outerH[pulsePhase], HIGH);
+  matrix.drawFastVLine(innerX[pulsePhase], innerY[pulsePhase], innerH[pulsePhase], HIGH);
+  matrix.drawFastVLine(matrix.width() - 1 - innerX[pulsePhase], innerY[pulsePhase], innerH[pulsePhase], HIGH);
+  if ((pulsePhase & 1U) == 0) {
+    matrix.drawPixel(0, 0, HIGH);
+    matrix.drawPixel(0, matrix.height() - 1, HIGH);
+    matrix.drawPixel(matrix.width() - 1, 0, HIGH);
+    matrix.drawPixel(matrix.width() - 1, matrix.height() - 1, HIGH);
+  }
+
+  display.updateDisplay = true;
+}
+
+void triggerAlarmBurst(DisplayState &display) {
+  if (alarmBurstCount < AlarmTotalBursts) {
+    alarmBurstCount++;
+  }
+
+  const uint8_t soundTrack = (uint8_t)(AlarmSoundFirstTrack + alarmBurstCount - 1);
+  alarmAnimationFrame = 0;
+  alarmFinalReturnPending = alarmBurstCount >= AlarmTotalBursts;
+  AlarmAnimation.start(-AlarmAnimationTick);
+  if (alarmFinalReturnPending) {
+    AlarmFinalDisplay.start();
+  } else {
+    AlarmRepeat.start();
+  }
+
+  DFPlayer.playFolder(AlarmSoundFolder, soundTrack);
+  drawAlarmAnimation(display, true);
+}
+
+void finishAlarmTakeover(DisplayState &display, bool stopAudio) {
+  if (stopAudio) stopDfPlayerPlayback();
+  alarmBurstCount = 0;
+  alarmAnimationFrame = 0;
+  alarmFinalReturnPending = false;
+  display.updateDisplay = false;
+  ClockState = alarmReturnState;
+}
+
+void startAlarmTakeover(DisplayState &display, ClockStates returnState) {
+  alarmReturnState = returnState;
+  cancelModeChangeCoilPulse();
+  restoreDisplayOutput(display);
+  stopVoiceCoilMotion();
+  stopDfPlayerPlayback();
+  alarmBurstCount = 0;
+  alarmAnimationFrame = 0;
+  alarmFinalReturnPending = false;
+  ClockState = _Clock_alarm_active_init;
+}
+
 void startVoiceCoilMotion(bool withKick = true) {
   voiceCoilState = withKick ? _vcKickHigh : _vcRandomMotion;
   if (withKick) {
@@ -738,6 +1612,16 @@ void updateVoiceCoilMotion() {
     currentLevel = voiceCoilOff;
     voiceCoilState = _vcRandomMotion;
     currentLevel = voiceCoilMid;
+    setVoiceCoilLevel(currentLevel);
+    voiceCoilPeriod = voiceCoilSettleMs;
+  } else if (voiceCoilState == _vcModePulseHigh && VoiceCoilMotion.check(voiceCoilPeriod)) {
+    currentLevel = voiceCoilKick;
+    setVoiceCoilLevel(voiceCoilOff);
+    voiceCoilState = _vcModePulseRelease;
+    voiceCoilPeriod = voiceCoilReleaseMs;
+  } else if (voiceCoilState == _vcModePulseRelease && VoiceCoilMotion.check(voiceCoilPeriod)) {
+    currentLevel = voiceCoilOff;
+    voiceCoilState = _vcOff;
     setVoiceCoilLevel(currentLevel);
     voiceCoilPeriod = voiceCoilSettleMs;
   } else if (voiceCoilState == _vcRandomMotion && VoiceCoilMotion.check(voiceCoilPeriod)) {
@@ -1086,10 +1970,16 @@ uint8_t keyboard(ClockStates key_DIR_CW, ClockStates key_DIR_CCW, ClockStates ke
   if (xQueueReceive(xQueue, &key, 0) == pdPASS) {
     switch (key) {
       case DIR_CW:
-        if (key_DIR_CW != _Clock_none) ClockState = key_DIR_CW;
+        if (key_DIR_CW != _Clock_none) {
+          ClockState = key_DIR_CW;
+          armModeChangeCoilPulse(key_DIR_CW);
+        }
         break;
       case DIR_CCW:
-        if (key_DIR_CCW != _Clock_none) ClockState = key_DIR_CCW;
+        if (key_DIR_CCW != _Clock_none) {
+          ClockState = key_DIR_CCW;
+          armModeChangeCoilPulse(key_DIR_CCW);
+        }
         break;
       case SW_DOWN:
         if (key_SW_DOWN != _Clock_none) ClockState = key_SW_DOWN;
@@ -1134,6 +2024,9 @@ void loadPreferences(void) {
   preferences.begin("clock", true);
   //preferences.clear();
   DingOnOff = preferences.getBool("DingOnOff", true);
+  alarmEnabled = preferences.getBool("AlarmOn", false);
+  alarmHour = (uint8_t)constrain(preferences.getUChar("AlarmHour", 7), 0, 23);
+  alarmMinute = (uint8_t)constrain(preferences.getUChar("AlarmMinute", 0), 0, 59);
   sWIFI_SSID = preferences.getString("ssid", WIFI_SSID);
   sWIFI_PASWD = preferences.getString("password", WIFI_PASWD);
   preferences.end();
@@ -1143,6 +2036,9 @@ void savePreferences(void) {
   preferences.begin("clock", false);
   //preferences.clear();
   preferences.putBool("DingOnOff", DingOnOff);
+  preferences.putBool("AlarmOn", alarmEnabled);
+  preferences.putUChar("AlarmHour", alarmHour);
+  preferences.putUChar("AlarmMinute", alarmMinute);
   preferences.putString("ssid", WiFi.SSID());
   preferences.putString("password", WiFi.psk());  
   preferences.end();
@@ -1365,12 +2261,13 @@ void setup() {
 
 	    client.setInsecure();
 	    SetupWiFi();
+    setupWebServer();
     {
       String startupMessage;
       if (fetchLastRemoteMessage(startupMessage) && !isRemoteMessageEmpty(startupMessage)) {
         PRINT("Startup Msg: ", startupMessage);
         PRINTLN;
-        queueRemoteMessage(startupMessage.c_str());
+        processIncomingRemoteMessage(startupMessage.c_str());
       } else {
         PRINTS("Startup Msg: none\n");
       }
@@ -1478,6 +2375,7 @@ void loop() {
     if (zoneInfo1.AnimateDone()) zoneInfo1.Reset();
     delay(10);
   } else {
+    webServer.handleClient();
     DisplayState &display = displayState;
     uint8_t key;
 
@@ -1512,6 +2410,10 @@ void loop() {
     LocalTime = CET.toLocal(now());
     const time_t wakeGreetingLocalTime = getWakeGreetingLocalTime(LocalTime);
     resetWakeGreetingFlagsIfNeeded(wakeGreetingLocalTime);
+    applyQueuedAlarmCommand();
+    if (voiceCoilState == _vcModePulseHigh || voiceCoilState == _vcModePulseRelease) {
+      updateVoiceCoilMotion();
+    }
 
     if (SensorUpdate.check(MeasurementFreg)) {
 
@@ -1645,15 +2547,28 @@ void loop() {
       }
     }
 
+    LocalTime = CET.toLocal(now());
+    const uint32_t alarmDayKey = buildLocalDateKey(LocalTime);
+    const uint16_t alarmMinuteOfDay = (uint16_t)hour(LocalTime) * 60U + (uint16_t)minute(LocalTime);
+    const bool alarmAlreadyTriggered = alarmLastTriggeredDayKey == alarmDayKey
+                                       && alarmLastTriggeredMinuteOfDay == alarmMinuteOfDay;
+    if (alarmEnabled && !alarmAlreadyTriggered && !isAlarmActiveState(ClockState)
+        && hour(LocalTime) == alarmHour && minute(LocalTime) == alarmMinute) {
+      alarmLastTriggeredDayKey = alarmDayKey;
+      alarmLastTriggeredMinuteOfDay = alarmMinuteOfDay;
+      startAlarmTakeover(display, normalizeClockStateForReturn(ClockState));
+    }
+
     // check if NTP sync is due?
     // If yes change clock status
-    if (NTPUpdateTask.check(NTPSyncPeriod)) {
+    if (!isAlarmActiveState(ClockState) && NTPUpdateTask.check(NTPSyncPeriod)) {
+      cancelModeChangeCoilPulse();
       ClockState = _Clock_NTP_Sync;
     }
 
     // check time dependant actions
 
-    {
+    if (!isAlarmActiveState(ClockState)) {
       LocalTime = CET.toLocal(now());
       int hourTemp = hour(LocalTime);
       if (ChimeQuarter.check(CHIMEQ)) {
@@ -1751,10 +2666,59 @@ void loop() {
           }
           display.updateDisplay = true;
         }
-        if (keyboard(_Clock_menu_init, _Clock_ip_init, _Clock_none, _Clock_none) == SW_UP) {
+        if (keyboard(_Clock_alarm_menu_init, _Clock_ip_init, _Clock_none, _Clock_none) == SW_UP) {
           display.dataMode = (display.dataMode + 1) % 3;
           StatTask.check(-DiagramDelay);
         }
+        break;
+
+      case _Clock_alarm_menu_init:
+        clearScreen();
+        clockReadyForRemoteMessages = false;
+        refreshAlarmMenuText(display);
+        display.updateDisplay = zoneInfo0.Animate(false);
+        goBackState = _Clock_alarm_menu_init;
+        ClockState = _Clock_alarm_menu;
+        break;
+
+      case _Clock_alarm_menu:
+        clockReadyForRemoteMessages = true;
+        display.updateDisplay |= zoneInfo0.Animate(false);
+        if (keyboard(_Clock_menu_init, _Clock_Temp_init, _Clock_none, _Clock_none) == SW_UP) {
+          setAlarmConfig(!alarmEnabled, alarmHour, alarmMinute, true);
+          refreshAlarmMenuText(display);
+          display.updateDisplay |= zoneInfo0.Animate(false);
+        }
+        break;
+
+      case _Clock_alarm_active_init:
+        clearScreen();
+        clockReadyForRemoteMessages = false;
+        triggerAlarmBurst(display);
+        goBackState = alarmReturnState;
+        ClockState = _Clock_alarm_active;
+        break;
+
+      case _Clock_alarm_active:
+        clockReadyForRemoteMessages = false;
+        if (!alarmEnabled) {
+          finishAlarmTakeover(display, true);
+          break;
+        }
+        key = keyboard(_Clock_none, _Clock_none, _Clock_none, _Clock_none);
+        if (key == SW_DOWN || key == SW_UP) {
+          finishAlarmTakeover(display, true);
+          break;
+        }
+        if (alarmFinalReturnPending) {
+          if (AlarmFinalDisplay.check(AlarmFinalDisplayMs)) {
+            finishAlarmTakeover(display, true);
+            break;
+          }
+        } else if (AlarmRepeat.check(AlarmRepeatDelayMs)) {
+          triggerAlarmBurst(display);
+        }
+        drawAlarmAnimation(display, false);
         break;
 
       case _Clock_ip_init:
@@ -2025,7 +2989,7 @@ void loop() {
       case _Clock_menu:
         clockReadyForRemoteMessages = true;
         display.updateDisplay = zoneInfo1.Animate(false);
-        if (keyboard(_Clock_menu_display_init, _Clock_Temp_init, _Clock_none, _Clock_none) == SW_UP) {
+        if (keyboard(_Clock_menu_display_init, _Clock_alarm_menu_init, _Clock_none, _Clock_none) == SW_UP) {
           DingOnOff = !DingOnOff;
           display.paramS = DingOnOff ? "On" : "Off";
           zoneInfo1.setText(display.paramS, _BLINK, _NONE_MOD, InfoSlow, PAs, PAe);
@@ -2217,9 +3181,11 @@ void loop() {
 #if EnableSoundTestMode
       if (ClockState == _Clock_sound_test) stopSoundTestPlayback();
 #endif
+      cancelModeChangeCoilPulse();
       ClockState = _Clock_remote_message_init;
     }
 
+    updatePendingModeChangeCoilPulse();
 
     if (display.updateDisplay) {
       if (displayEnabled && screenSaverNotActive) {
@@ -2280,7 +3246,7 @@ void taskMQTT(void *parameter) {
       Adafruit_MQTT_Subscribe *subscription;
       while ((subscription = mqtt.readSubscription(10))) {
         if (subscription == &msgMQTTSub) {
-          queueRemoteMessage((char *)msgMQTTSub.lastread);
+          processIncomingRemoteMessage((char *)msgMQTTSub.lastread);
           PRINT("MQTT message: ", (char *)msgMQTTSub.lastread);
           PRINTLN;
         }
