@@ -1259,6 +1259,7 @@ const alarmForm = $('#alarm-form');
 const alarmEditorFields = [$('#alarm-hour'), $('#alarm-minute'), $('#alarm-enabled')];
 let alarmFormDirty = false;
 let alarmFormEditing = false;
+let refreshErrorShown = false;
 function note(text, bad = false) {
   const node = $('#alarm-note');
   node.textContent = text;
@@ -1288,8 +1289,13 @@ async function refresh() {
   try {
     const response = await fetch('/api/status', { cache: 'no-store' });
     const status = await response.json();
+    if (refreshErrorShown) {
+      note('');
+      refreshErrorShown = false;
+    }
     paint(status);
   } catch (error) {
+    refreshErrorShown = true;
     note('Clock did not answer: ' + error.message, true);
   }
 }
